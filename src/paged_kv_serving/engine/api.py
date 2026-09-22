@@ -585,6 +585,11 @@ def _install_admin_routes(
         # Under the engine lock: no forward pass can be reading the old weights or the KV blocks
         # they produced while they are replaced.
         if not await service.run_exclusive(swap):
+            audit.append(
+                principal.key_id,
+                "weights.swap_rejected",
+                {"name": body.name, "error": "engine_busy"},
+            )
             raise AppError(
                 409, "engine_busy", "Weights can only be swapped while the engine is idle."
             )
@@ -636,6 +641,10 @@ async def _collect_unless_disconnected(
     watcher = asyncio.ensure_future(watch())
     try:
         await asyncio.wait({collector, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    except BaseException:
+        # The handler itself was cancelled (shutdown): do not leave the collector behind.
+        collector.cancel()
+        raise
     finally:
         watcher.cancel()
     if collector.done():

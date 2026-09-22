@@ -840,6 +840,13 @@ async def test_weight_swap_refuses_a_different_shape_and_a_busy_engine(
         assert busy.status_code == 409
         assert busy.json()["error"]["code"] == "engine_busy"
         assert (await busy_request).status_code == 200
+    # Every refused swap leaves its intent and its outcome in the log.
+    assert [(entry.action, entry.detail.get("error")) for entry in audit.entries()] == [
+        ("weights.swap.requested", None),
+        ("weights.swap_rejected", "shape_mismatch"),
+        ("weights.swap.requested", None),
+        ("weights.swap_rejected", "engine_busy"),
+    ]
 
 
 async def test_a_draining_service_finishes_in_flight_work_and_refuses_new_work(
