@@ -75,3 +75,14 @@ def test_admissions_never_exceed_the_token_bucket_bound(
             window = admitted[j] - start
             bound = burst + rate * window
             assert j - i + 1 <= bound + 1e-6 * (1 + bound)
+
+
+def test_a_refund_is_capped_at_capacity_and_must_be_non_negative() -> None:
+    bucket = TokenBucket(rate=1.0, capacity=10.0, now=0.0)
+    assert bucket.try_acquire(0.0, 8.0) == (True, 0.0)
+    bucket.refund(5.0)
+    assert bucket.tokens == 7.0
+    bucket.refund(100.0)
+    assert bucket.tokens == 10.0
+    with pytest.raises(ValueError, match="cost"):
+        bucket.refund(-1.0)

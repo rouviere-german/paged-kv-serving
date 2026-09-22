@@ -170,12 +170,29 @@ class EntitlementGuard:
         return None
 
     def release(self, key_id: str, n: int = 1) -> None:
-        """Give back a request's ``n`` in-flight slots. Tokens are not refunded here."""
+        """Give back a request's ``n`` in-flight slots once it has run (finished or aborted).
+
+        Tokens are not refunded: the key reserved them, and a request that ran -- even one the
+        client abandoned -- spent the server's time.
+        """
         remaining = self.inflight(key_id) - n
         if remaining > 0:
             self._inflight[key_id] = remaining
         else:
             self._inflight.pop(key_id, None)
+
+    def refund(self, key_id: str, *, prompt_tokens: int, max_new_tokens: int, n: int = 1) -> None:
+        """Undo a successful :meth:`check` for a request the *server* then refused.
+
+        Admission control runs after the key's own limits, so a request turned away for load or an
+        infeasible deadline has already been charged. It never ran, so the slots and the whole
+        charge come back; otherwise a client retrying politely after a 503 would drain its own
+        tokens-per-minute and end up with a 429 without ever having been served.
+        """
+        self.release(key_id, n)
+        bucket = self._buckets.get(key_id)
+        if bucket is not None:
+            bucket.refund(float(prompt_tokens + n * max_new_tokens))
 
     def snapshot(self) -> Mapping[str, int]:
         return dict(self._inflight)

@@ -41,6 +41,12 @@ class TokenBucket:
             return True, 0.0
         return False, (cost - self.tokens) / self.rate
 
+    def refund(self, cost: float) -> None:
+        """Give back tokens taken for work that never ran. Never fills past ``capacity``."""
+        if cost < 0:
+            raise ValueError("cost must be >= 0")
+        self.tokens = min(self.capacity, self.tokens + cost)
+
 
 @dataclass(frozen=True, slots=True)
 class RateDecision:

@@ -250,3 +250,32 @@ def test_a_policy_caps_the_number_of_parallel_samples() -> None:
     )
     with pytest.raises(ValueError, match="max_n"):
         policy(max_n=0)
+
+
+def test_a_refund_returns_the_charge_and_the_slots() -> None:
+    """Review regression: a request the *server* refused still spent the key's token budget.
+
+    ``refund`` is what the engine calls when admission control turns a request away after the
+    key's own checks passed: the slots and the worst-case token charge both come back.
+    """
+    entitlements = guard(policy(tokens_per_minute=100, max_concurrent_requests=8, max_n=4))
+    for _ in range(5):
+        assert (
+            entitlements.check(
+                KEY, slo_class=SloClass.BATCH, prompt_tokens=40, max_new_tokens=15, n=4
+            )
+            is None
+        )
+        assert entitlements.inflight(KEY) == 4
+        entitlements.refund(KEY, prompt_tokens=40, max_new_tokens=15, n=4)
+        assert entitlements.inflight(KEY) == 0
+    # The bucket never holds more than its capacity (100), however much is refunded.
+    entitlements.refund(KEY, prompt_tokens=1_000, max_new_tokens=1, n=1)
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=36, max_new_tokens=32, n=2)
+        is None
+    )
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1)
+        is RejectionReason.KEY_TOKEN_RATE
+    )

@@ -357,7 +357,13 @@ class Engine:
         )
         if not decision.admitted:
             if self.entitlements is not None:
-                self.entitlements.release(request.key_id, request.n)
+                # Refused for load, not for anything the key did: its budget is not spent.
+                self.entitlements.refund(
+                    request.key_id,
+                    prompt_tokens=request.prompt_len,
+                    max_new_tokens=sampling.max_new_tokens,
+                    n=request.n,
+                )
             reason = decision.reason or RejectionReason.DEADLINE_INFEASIBLE
             self.metrics.rejections_total.labels(reason.value).inc()
             return decision

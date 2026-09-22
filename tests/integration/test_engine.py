@@ -10,6 +10,7 @@ import pytest
 from paged_kv_serving.engine.admission import RejectionReason
 from paged_kv_serving.engine.config import EngineConfig, SloClass
 from paged_kv_serving.engine.engine import Engine, RequestOutput
+from paged_kv_serving.engine.keys import EntitlementGuard, KeyPolicy, KeyPolicyStore
 from paged_kv_serving.engine.model import LanguageModel
 from paged_kv_serving.engine.sampling import sample_token
 from paged_kv_serving.engine.sequence import (
@@ -446,4 +447,36 @@ def test_each_parallel_sample_depends_only_on_the_seed_and_its_index(
             expected = sampled_reference(tiny_model, request, sample.sample_index, steps=12)
             assert list(sample.token_ids) == expected, (request.request_id, sample.sample_index)
         assert len({sample.token_ids for sample in samples}) > 1, "samples should differ"
+    engine.check_invariants()
+
+
+def test_a_request_the_server_refuses_does_not_spend_the_keys_budget(
+    tiny_model: LanguageModel, engine_config: EngineConfig
+) -> None:
+    """Review regression: 503 rejections charged the token bucket and were never refunded.
+
+    A client retrying after "deadline infeasible" drained its tokens/min and then got 429 without
+    ever having been served.
+    """
+    store = KeyPolicyStore(
+        [
+            KeyPolicy(
+                key_id="tenant-a",
+                slo_classes=frozenset({SloClass.INTERACTIVE}),
+                tokens_per_minute=100,
+                max_concurrent_requests=2,
+            )
+        ]
+    )
+    engine = Engine(
+        tiny_model, engine_config, entitlements=EntitlementGuard(store, clock=lambda: 0.0)
+    )
+    prompt = list(range(1, 41))
+    for attempt in range(4):
+        decision = engine.submit(request_for(attempt, prompt, max_new_tokens=10, deadline=1e-6))
+        assert decision.reason is RejectionReason.DEADLINE_INFEASIBLE, attempt
+    assert engine.entitlements is not None
+    assert engine.entitlements.inflight("tenant-a") == 0
+    assert engine.submit(request_for(9, prompt, max_new_tokens=10)).admitted
+    engine.run_until_idle()
     engine.check_invariants()
