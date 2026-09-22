@@ -102,7 +102,10 @@ async def test_requests_are_launched_on_schedule_and_every_outcome_is_kept() -> 
     assert outcomes[0].tokens == 2
     assert outcomes[0].ttft is not None
     assert outcomes[0].latency is not None
-    assert outcomes[0].latency >= 0.2
+    # The server's 200 ms is inside the latency. asyncio times its sleeps with time.monotonic,
+    # whose resolution is one 15.6 ms tick on Windows (CPython 3.12), and fires a timer up to one
+    # tick early -- measured against perf_counter that is as low as 0.186 s here.
+    assert outcomes[0].latency >= 0.2 - time.get_clock_info("monotonic").resolution
     assert outcomes[2].status == 503
     assert outcomes[2].error == "deadline_infeasible"
     assert outcomes[3].error == "request_timeout"
