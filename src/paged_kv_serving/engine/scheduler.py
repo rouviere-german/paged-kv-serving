@@ -7,27 +7,33 @@ batching instead re-decides the batch **every iteration**: a finished sequence l
 a newly arrived one joins the very next step, and nothing is padded because the batch is a flat
 list of tokens rather than a rectangle.
 
-One iteration fills a token budget in three phases:
+One iteration fills a token budget in two phases:
 
 1. **Decode.** One token for each running sequence that has already consumed its prompt, in
    priority order. Decode goes first so a large prompt can never delay sequences that are already
    streaming -- the head-of-line blocking that static batching cannot avoid.
-2. **Continue prefill.** Sequences whose prompt is only partly computed take the rest of the
-   budget in chunks. A 2000-token prompt is therefore spread over several iterations instead of
-   monopolising one (chunked prefill, as in Agrawal et al., "Taming Throughput-Latency Tradeoff
-   in LLM Inference with Sarathi-Serve", OSDI 2024).
-3. **Admit.** Waiting sequences join while budget, sequence slots and blocks remain, ordered by
-   SLO class first and earliest deadline second.
+2. **Prefill, in priority order.** Running sequences whose prompt is only partly computed and
+   waiting sequences share one pass ordered by SLO class, then earliest deadline, then arrival.
+   A running prompt takes its next chunk; a waiting one is admitted with its first chunk while
+   sequence slots and blocks remain. A 2000-token prompt is therefore spread over several
+   iterations instead of monopolising one (chunked prefill, as in Agrawal et al., "Taming
+   Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve", OSDI 2024), and a request
+   with an earlier deadline is not held behind a prompt that merely started first -- the order
+   admission control assumes when it promises a deadline.
 
-In phases 2 and 3, while a higher SLO class has any sequence in the engine, prefill of the lower
-classes shares an allowance of ``lower_class_prefill_share`` of the budget. Decode is never
-capped. The allowance exists because iteration time grows with batch tokens: without it, a flood
-of long batch prompts fills every iteration to the full budget and stretches each interactive
-decode step to the cost of a full-budget forward pass.
+In phase 2, while a higher SLO class has any sequence in the engine, prefill of the lower classes
+shares an allowance of ``lower_class_prefill_share`` of the budget. Decode is never capped. The
+allowance exists because iteration time grows with batch tokens: without it, a flood of long
+batch prompts fills every iteration to the full budget and stretches each interactive decode step
+to the cost of a full-budget forward pass.
 
 When the KV pool cannot satisfy a running sequence, the lowest-priority *unscheduled* sequence is
 preempted: its blocks are released and it returns to the waiting queue to be recomputed later.
 Recomputation keeps the tokens it already produced, so preemption costs work but never output.
+Liveness: no iteration is empty while work is queued. A decoder or a running prefill that cannot
+get a block preempts somebody behind it, a waiter that is not admitted holds no blocks, and the
+watermark is ignored when nothing is running -- so the highest-priority sequence can always run
+(``EngineConfig`` guarantees one maximum-length sequence fits the pool).
 """
 
 from __future__ import annotations
@@ -210,12 +216,10 @@ class Scheduler:
             remaining=self.config.lower_class_prefill_tokens,
         )
         budget = self._schedule_decodes(budget, scheduled, preempted)
-        budget = self._continue_prefills(budget, scheduled, preempted, allowance)
         # Nothing new is admitted in an iteration that had to preempt. Re-admitting the victim
         # immediately would hand back the blocks that were just taken from it and preempt it
         # again next iteration; admitting somebody else instead would be a priority inversion.
-        if not preempted:
-            self._admit_waiting(budget, scheduled, admitted, allowance)
+        self._schedule_prefills(budget, scheduled, preempted, admitted, allowance)
 
         self._waiting.sort(key=lambda sequence: sequence.priority_key())
         entries = tuple(self._entry(item) for item in scheduled)
@@ -265,110 +269,143 @@ class Scheduler:
             budget -= 1
         return budget
 
-    def _continue_prefills(
+    def _schedule_prefills(
         self,
         budget: int,
         scheduled: list[ScheduledSequence],
         preempted: list[str],
+        admitted: list[str],
         allowance: _LowerClassAllowance,
     ) -> int:
-        """Give the rest of the budget to running sequences whose prompt is still incomplete.
+        """Running prefills and waiting sequences, in one pass in priority order.
 
-        A prefill that cannot get a single block preempts the lowest-priority prefill behind it.
-        Without that, two long prompts part-way through prefill can hold the whole pool between
-        them with no decoder left to trigger a preemption, and every later iteration is empty.
+        One order for both is what admission control counts on: "work ahead of a deadline" means
+        higher classes plus same-class work due no later (docs/adr/0004). Continuing every running
+        prefill before admitting anybody would let a prompt with a loose deadline that happened to
+        start first take the whole budget ahead of a tight one that arrived a moment later.
+
+        Admission closes at the first waiter that cannot get a slot, memory or allowance (a
+        lower-priority waiter must not jump it), and for the rest of any iteration that preempted;
+        running prefills behind it still continue, because they already hold their blocks and
+        finishing them is what frees memory.
         """
-        candidates = sorted(
-            (sequence for sequence in self._running if not sequence.is_decoding),
+        self._waiting.sort(key=lambda sequence: sequence.priority_key())
+        order = sorted(
+            [*(item for item in self._running if not item.is_decoding), *self._waiting],
             key=lambda item: item.priority_key(),
         )
-        for position, sequence in enumerate(candidates):
+        admitting = not preempted
+        for position, sequence in enumerate(order):
             if budget <= 0:
                 break
-            if sequence.status is not SequenceStatus.RUNNING:
-                continue  # preempted earlier in this pass
-            wanted = allowance.clip(sequence, min(budget, sequence.num_uncomputed_tokens))
-            if wanted <= 0:
-                continue
-            chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
-            while chunk <= 0:
-                victims = [
-                    other
-                    for other in candidates[position + 1 :]
-                    if other.status is SequenceStatus.RUNNING and other.block_table
-                ]
-                if not victims:
-                    break
-                victim = victims[-1]
-                self._preempt(victim)
-                preempted.append(victim.seq_id)
-                chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
-            if chunk <= 0:
-                continue
-            try:
-                self.cache.reserve(sequence, sequence.num_computed_tokens + chunk)
-            except BlockAllocationError:  # pragma: no cover - guarded by _max_chunk_by_memory
-                continue
-            scheduled.append(
-                ScheduledSequence(
+            if sequence.status is SequenceStatus.RUNNING:
+                before = len(preempted)
+                budget = self._continue_prefill(
                     sequence,
-                    chunk,
-                    is_prefill=True,
-                    produces_token=sequence.num_computed_tokens + chunk == sequence.num_tokens,
+                    budget,
+                    behind=order[position + 1 :],
+                    scheduled=scheduled,
+                    preempted=preempted,
+                    allowance=allowance,
                 )
-            )
-            allowance.spend(sequence, chunk)
-            budget -= chunk
+                admitting = admitting and len(preempted) == before
+            elif admitting:
+                spent = self._admit(sequence, budget, scheduled, admitted, allowance)
+                admitting = spent > 0
+                budget -= spent
         return budget
 
-    def _admit_waiting(
+    def _continue_prefill(
         self,
+        sequence: Sequence,
+        budget: int,
+        *,
+        behind: list[Sequence],
+        scheduled: list[ScheduledSequence],
+        preempted: list[str],
+        allowance: _LowerClassAllowance,
+    ) -> int:
+        """Next chunk of a running sequence's prompt. Returns the budget left.
+
+        A prefill that cannot get a single block preempts the lowest-priority running prefill
+        behind it. Without that, two long prompts part-way through prefill can hold the whole
+        pool between them with no decoder left to trigger a preemption, and every later iteration
+        is empty.
+        """
+        wanted = allowance.clip(sequence, min(budget, sequence.num_uncomputed_tokens))
+        if wanted <= 0:
+            return budget
+        chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
+        while chunk <= 0:
+            victims = [
+                other
+                for other in behind
+                if other.status is SequenceStatus.RUNNING and other.block_table
+            ]
+            if not victims:
+                return budget
+            victim = victims[-1]
+            self._preempt(victim)
+            preempted.append(victim.seq_id)
+            chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
+        try:
+            self.cache.reserve(sequence, sequence.num_computed_tokens + chunk)
+        except BlockAllocationError:  # pragma: no cover - guarded by _max_chunk_by_memory
+            return budget
+        scheduled.append(
+            ScheduledSequence(
+                sequence,
+                chunk,
+                is_prefill=True,
+                produces_token=sequence.num_computed_tokens + chunk == sequence.num_tokens,
+            )
+        )
+        allowance.spend(sequence, chunk)
+        return budget - chunk
+
+    def _admit(
+        self,
+        sequence: Sequence,
         budget: int,
         scheduled: list[ScheduledSequence],
         admitted: list[str],
         allowance: _LowerClassAllowance,
     ) -> int:
-        """Admit waiting sequences in priority order while budget, slots and blocks allow."""
-        self._waiting.sort(key=lambda sequence: sequence.priority_key())
-        queue = deque(self._waiting)
-        while queue and budget > 0 and len(self._running) < self.config.max_running_seqs:
-            sequence = queue[0]
-            reuse = self.cache.attach_prefix(sequence, record=False)
-            # The watermark keeps room for the decode steps of running sequences. With nothing
-            # running it protects nobody, and honouring it could refuse the only request forever.
-            watermark = self._watermark_blocks() if self._running else 0
-            chunk = min(budget, sequence.num_uncomputed_tokens)
-            chunk = min(chunk, self._max_chunk_by_memory(sequence, reserve_blocks=watermark))
-            chunk = allowance.clip(sequence, chunk)
-            if chunk <= 0:
-                # Not enough memory (or lower-class allowance) for even one token of the
-                # highest-priority waiter. Admitting a lower-priority one instead would starve it,
-                # so the phase stops here -- and the waiter lets go of the cached blocks it matched,
-                # so that a running prefill can still evict them.
-                self.cache.detach_prefix(sequence)
-                break
-            try:
-                self.cache.reserve(sequence, sequence.num_computed_tokens + chunk)
-            except BlockAllocationError:  # pragma: no cover - guarded by _max_chunk_by_memory
-                self.cache.detach_prefix(sequence)
-                break
-            self.cache.record_prefix(reuse)
-            queue.popleft()
-            self._waiting.remove(sequence)
-            sequence.status = SequenceStatus.RUNNING
-            self._running.append(sequence)
-            scheduled.append(
-                ScheduledSequence(
-                    sequence,
-                    chunk,
-                    is_prefill=True,
-                    produces_token=sequence.num_computed_tokens + chunk == sequence.num_tokens,
-                )
+        """Admit one waiting sequence with its first chunk. Returns the tokens spent (0: not)."""
+        if len(self._running) >= self.config.max_running_seqs:
+            return 0
+        reuse = self.cache.attach_prefix(sequence, record=False)
+        # The watermark keeps room for the decode steps of running sequences. With nothing
+        # running it protects nobody, and honouring it could refuse the only request forever.
+        watermark = self._watermark_blocks() if self._running else 0
+        chunk = min(budget, sequence.num_uncomputed_tokens)
+        chunk = min(chunk, self._max_chunk_by_memory(sequence, reserve_blocks=watermark))
+        chunk = allowance.clip(sequence, chunk)
+        if chunk <= 0:
+            # Not enough memory (or lower-class allowance) for even one token. The waiter lets go
+            # of the cached blocks it matched, so a running prefill can still evict them.
+            self.cache.detach_prefix(sequence)
+            return 0
+        try:
+            self.cache.reserve(sequence, sequence.num_computed_tokens + chunk)
+        except BlockAllocationError:  # pragma: no cover - guarded by _max_chunk_by_memory
+            self.cache.detach_prefix(sequence)
+            return 0
+        self.cache.record_prefix(reuse)
+        self._waiting.remove(sequence)
+        sequence.status = SequenceStatus.RUNNING
+        self._running.append(sequence)
+        scheduled.append(
+            ScheduledSequence(
+                sequence,
+                chunk,
+                is_prefill=True,
+                produces_token=sequence.num_computed_tokens + chunk == sequence.num_tokens,
             )
-            admitted.append(sequence.seq_id)
-            allowance.spend(sequence, chunk)
-            budget -= chunk
-        return budget
+        )
+        admitted.append(sequence.seq_id)
+        allowance.spend(sequence, chunk)
+        return chunk
 
     def _entry(self, item: ScheduledSequence) -> BatchEntry:
         sequence = item.sequence

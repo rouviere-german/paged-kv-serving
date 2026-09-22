@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
+from hypothesis import HealthCheck, given, settings
+from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.admission import RejectionReason
 from paged_kv_serving.engine.config import EngineConfig, SloClass
 from paged_kv_serving.engine.engine import Engine, RequestOutput
@@ -199,3 +202,106 @@ def test_the_open_loop_driver_submits_on_schedule_not_on_completion(
     assert all(output.latency >= output.ttft for output in result.outputs)
     assert result.wall_seconds > 0
     engine.check_invariants()
+
+
+#: Prompts much longer than the per-iteration budget, so a prompt is still mid-prefill when later
+#: requests arrive -- the situation in which the scheduler's order and admission's order must agree.
+LONG_PROMPTS = EngineConfig(
+    block_size=8,
+    num_blocks=256,
+    max_batched_tokens=32,
+    max_running_seqs=8,
+    max_prompt_tokens=160,
+    max_new_tokens=16,
+    max_context_tokens=192,
+    enable_prefix_cache=False,
+)
+
+
+def test_an_earlier_deadline_arriving_mid_prefill_is_served_first(
+    tiny_model: LanguageModel,
+) -> None:
+    """Review counterexample: admission assumed EDF order, the scheduler did not follow it.
+
+    A is part-way through a 160-token prompt with a loose deadline when B arrives with a tight
+    one. Admission predicted B done in 0.096 s by counting A's remaining prefill as *behind* B
+    (later deadline), but the scheduler let the running prefill take the whole budget first and
+    B finished at 0.169 s against a 0.132 s deadline.
+    """
+    engine, clock = simulated_engine(tiny_model, config=LONG_PROMPTS)
+    loose = Request(
+        request_id="A",
+        prompt_token_ids=tuple(index % VOCAB for index in range(160)),
+        sampling=SamplingParams(max_new_tokens=1),
+        deadline_seconds=10.0,
+        arrival_time=0.0,
+    )
+    tight = Request(
+        request_id="B",
+        prompt_token_ids=tuple((index * 3) % VOCAB for index in range(8)),
+        sampling=SamplingParams(max_new_tokens=2),
+        deadline_seconds=0.1,
+        arrival_time=0.032,
+    )
+    outputs = {output.request_id: output for output in drain(engine, clock, [loose, tight])}
+    assert set(outputs) == {"A", "B"}, "both requests fit and should have been admitted"
+    assert outputs["B"].met_deadline, f"B finished at {outputs['B'].finish_time:.3f}s"
+    assert outputs["A"].met_deadline
+
+
+@st.composite
+def long_prompt_workloads(draw: st.DrawFn) -> list[Request]:
+    """At most ``max_running_seqs`` requests, so the running-set cap never binds (ADR 0004)."""
+    count = draw(st.integers(min_value=2, max_value=LONG_PROMPTS.max_running_seqs))
+    arrival = 0.0
+    requests: list[Request] = []
+    for index in range(count):
+        arrival += draw(st.sampled_from([0.0, 0.003, 0.016, 0.032, 0.07, 0.2]))
+        prompt_tokens = draw(
+            st.one_of(st.integers(1, 16), st.integers(33, LONG_PROMPTS.max_prompt_tokens))
+        )
+        requests.append(
+            Request(
+                request_id=f"w{index}",
+                prompt_token_ids=tuple(
+                    (index * 5 + offset) % VOCAB for offset in range(prompt_tokens)
+                ),
+                sampling=SamplingParams(max_new_tokens=draw(st.integers(1, 16)), seed=index),
+                slo_class=draw(st.sampled_from([SloClass.INTERACTIVE, SloClass.BATCH])),
+                deadline_seconds=draw(
+                    st.one_of(
+                        st.none(),
+                        st.sampled_from([0.05, 0.1, 0.2, 0.5, 2.0, 10.0]),
+                        st.floats(min_value=0.02, max_value=2.0),
+                    )
+                ),
+                arrival_time=arrival,
+            )
+        )
+    return requests
+
+
+@settings(
+    max_examples=hypothesis_examples(60),
+    deadline=None,
+    suppress_health_check=[HealthCheck.too_slow],
+)
+@given(requests=long_prompt_workloads())
+def test_admitted_requests_meet_their_deadlines_when_prompts_outlast_the_budget(
+    tiny_model: LanguageModel, requests: list[Request]
+) -> None:
+    """Search for counterexamples to the admission guarantee with prompts longer than the budget.
+
+    The conditions are the ones the guarantee is stated under (ADR 0004): an exact latency model,
+    a KV pool that never forces a preemption and no more requests than running slots.
+    """
+    engine, clock = simulated_engine(tiny_model, config=LONG_PROMPTS)
+    outputs = drain(engine, clock, requests)
+    engine.check_invariants()
+    assert engine.scheduler.stats.preemptions == 0, "the pool is sized so memory never binds"
+    missed = [
+        (output.request_id, round(output.finish_time, 4), output.deadline)
+        for output in outputs
+        if output.met_deadline is False
+    ]
+    assert missed == []
