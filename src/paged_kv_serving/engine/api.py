@@ -16,7 +16,9 @@ SHA-256 of the prompt, which is enough to correlate a complaint with a request a
 reconstruct what anybody asked.
 
 Admin routes (flush the prefix cache, swap the weights) need a key whose policy grants the admin
-scope, and each one appends to the hash-chained audit log before returning.
+scope. The hash-chained audit log records the intent *before* anything changes and the outcome
+after; if the intent cannot be written (a tampered chain, a full disk) the action is refused with
+503 rather than performed unrecorded. Refused attempts by non-admin keys are recorded too.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ from paged_kv_serving.core.errors import AppError
 from paged_kv_serving.core.logging import get_logger
 from paged_kv_serving.core.security import Principal, require_api_key
 from paged_kv_serving.engine.admission import RejectionReason
-from paged_kv_serving.engine.audit import AuditLog
+from paged_kv_serving.engine.audit import AuditChainError, AuditEntry, AuditLog
 from paged_kv_serving.engine.config import EngineConfig, SloClass
 from paged_kv_serving.engine.engine import Engine, RequestOutput
 from paged_kv_serving.engine.keys import EntitlementGuard, KeyPolicy, KeyPolicyStore
@@ -214,6 +216,33 @@ def build_service(
     return EngineService(engine)
 
 
+def _default_audit_log(settings: Settings) -> AuditLog:
+    key = settings.audit_hmac_key
+    return AuditLog(
+        settings.data_dir / "admin-audit.jsonl",
+        key=key.get_secret_value().encode("utf-8") if key is not None else None,
+    )
+
+
+def _audit_intent(
+    audit: AuditLog, actor: str, action: str, detail: dict[str, Any] | None = None
+) -> AuditEntry:
+    """Record what is about to happen, or refuse to let it happen.
+
+    ``append`` verifies the whole chain first, so a tampered log, like an unwritable one, stops
+    the privileged action before it starts.
+    """
+    try:
+        return audit.append(actor, action, detail)
+    except (AuditChainError, OSError) as exc:
+        _log.error("audit_unavailable", action=action, error_type=type(exc).__name__)
+        raise AppError(
+            503,
+            "audit_unavailable",
+            "The audit log cannot be written, so the operation was not performed.",
+        ) from exc
+
+
 def _principal_policy(request: HttpRequest, principal: Principal) -> KeyPolicy | None:
     store: KeyPolicyStore | None = request.app.state.key_policies
     return store.get(principal.key_id) if store is not None else None
@@ -263,7 +292,7 @@ def create_api(
         else build_service(checkpoint, cfg, registry=metrics_registry)
     )
     tokenizer = checkpoint.tokenizer
-    audit = audit_log if audit_log is not None else AuditLog(cfg.data_dir / "admin-audit.jsonl")
+    audit = audit_log if audit_log is not None else _default_audit_log(cfg)
     policies = parse_key_policies(cfg.key_policies)
 
     @asynccontextmanager
@@ -456,9 +485,16 @@ def _install_admin_routes(
 ) -> None:
     """Flush the prefix cache and swap weights: admin scope only, every call audited."""
 
-    def _require_admin(request: HttpRequest, principal: Principal) -> KeyPolicy:
+    def _require_admin(request: HttpRequest, principal: Principal, operation: str) -> KeyPolicy:
         policy = _principal_policy(request, principal)
         if policy is None or not policy.admin:
+            # A refused attempt is evidence too. It is refused whether or not it can be recorded.
+            try:
+                audit.append(principal.key_id, "admin.denied", {"operation": operation})
+            except (AuditChainError, OSError) as exc:
+                _log.error(
+                    "audit_unavailable", action="admin.denied", error_type=type(exc).__name__
+                )
             raise AppError(403, "forbidden", "This operation requires the admin scope.")
         return policy
 
@@ -466,7 +502,8 @@ def _install_admin_routes(
     async def flush_prefix_cache(
         principal: PrincipalDep, http_request: HttpRequest
     ) -> dict[str, Any]:
-        _require_admin(http_request, principal)
+        _require_admin(http_request, principal, "prefix_cache.flush")
+        _audit_intent(audit, principal.key_id, "prefix_cache.flush.requested")
         released = await service.run_exclusive(service.engine.flush_prefix_cache)
         entry = audit.append(principal.key_id, "prefix_cache.flush", {"released_blocks": released})
         return {"released_blocks": released, "audit_index": entry.index, "audit_head": entry.digest}
@@ -475,7 +512,13 @@ def _install_admin_routes(
     async def swap_weights(
         body: AdminWeightSwap, principal: PrincipalDep, http_request: HttpRequest
     ) -> dict[str, Any]:
-        _require_admin(http_request, principal)
+        _require_admin(http_request, principal, "weights.swap")
+        _audit_intent(
+            audit,
+            principal.key_id,
+            "weights.swap.requested",
+            {"name": body.name, "manifest_sha256": body.manifest_sha256},
+        )
         engine = service.engine
         directory = Path(cfg.weights_root) / body.name
         try:

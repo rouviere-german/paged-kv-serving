@@ -33,7 +33,7 @@ from paged_kv_serving.engine.api import (
     create_api,
     parse_key_policies,
 )
-from paged_kv_serving.engine.audit import AuditLog
+from paged_kv_serving.engine.audit import AuditChainError, AuditLog
 from paged_kv_serving.engine.config import EngineConfig
 from paged_kv_serving.engine.engine import Engine
 from paged_kv_serving.engine.keys import EntitlementGuard
@@ -511,14 +511,86 @@ async def test_admin_operations_need_the_admin_scope_and_are_audited(
         )
         denied = await client.post("/v1/admin/prefix-cache/flush", headers=headers(USER))
         assert denied.status_code == 403
-        assert audit.entries() == []
+        # Refused attempts are evidence too (review: they used to leave no trace).
+        assert [(entry.action, entry.actor, entry.detail) for entry in audit.entries()] == [
+            ("admin.denied", hash_api_key(USER)[:12], {"operation": "prefix_cache.flush"})
+        ]
         flushed = await client.post("/v1/admin/prefix-cache/flush", headers=headers(ADMIN))
         assert flushed.status_code == 200
         assert flushed.json()["released_blocks"] > 0
     entries = audit.entries()
-    assert [entry.action for entry in entries] == ["prefix_cache.flush"]
-    assert entries[0].actor == hash_api_key(ADMIN)[:12]
+    # The intent is written before the cache is touched, the outcome after.
+    assert [entry.action for entry in entries] == [
+        "admin.denied",
+        "prefix_cache.flush.requested",
+        "prefix_cache.flush",
+    ]
+    assert {entry.actor for entry in entries[1:]} == {hash_api_key(ADMIN)[:12]}
     assert audit.verify(expect_head=flushed.json()["audit_head"]) == entries[-1].digest
+
+
+async def test_an_admin_action_is_refused_when_its_audit_entry_cannot_be_written(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review regression: flush and swap acted first and audited afterwards.
+
+    With one byte of the audit log edited, a flush still emptied the cache and then failed with
+    500, leaving no record of it. The intent entry is now written (after verifying the chain)
+    before anything changes, so a log that cannot be appended to blocks the action instead.
+    """
+    settings = settings_for(tmp_path)
+    digest = _second_checkpoint(checkpoint, settings.weights_root / "v2", seed=5)
+    audit = AuditLog(tmp_path / "audit.jsonl")
+    app = create_api(checkpoint, settings, audit_log=audit)
+    body = {"prompt_token_ids": list(range(1, 40)), "max_tokens": 2}
+    async for client in running_client(app):
+        await client.post("/v1/completions", json=body, headers=headers(USER))
+        first = await client.post("/v1/admin/prefix-cache/flush", headers=headers(ADMIN))
+        assert first.status_code == 200
+        released = first.json()["released_blocks"]
+        await client.post("/v1/completions", json=body, headers=headers(USER))
+        engine = app.state.engine_service.engine
+        cached = len(engine.prefix_cache)
+        assert cached > 0
+        text = audit.path.read_text(encoding="utf-8")
+        tampered = text.replace(
+            f'"released_blocks": {released}', f'"released_blocks": {released + 1}'
+        )
+        assert tampered != text
+        audit.path.write_text(tampered, encoding="utf-8")
+
+        refused = await client.post("/v1/admin/prefix-cache/flush", headers=headers(ADMIN))
+        assert refused.status_code == 503
+        assert refused.json()["error"]["code"] == "audit_unavailable"
+        assert len(engine.prefix_cache) == cached, "the cache must not be flushed unaudited"
+        swap = await client.post(
+            "/v1/admin/weights",
+            json={"name": "v2", "manifest_sha256": digest},
+            headers=headers(ADMIN),
+        )
+        assert swap.status_code == 503
+        assert swap.json()["error"]["code"] == "audit_unavailable"
+        assert app.state.checkpoint.model.weights is checkpoint.model.weights
+        # A denied attempt is still refused when it cannot be recorded.
+        denied = await client.post("/v1/admin/prefix-cache/flush", headers=headers(USER))
+        assert denied.status_code == 403
+    assert audit.path.read_text(encoding="utf-8") == tampered, "nothing appended after tamper"
+
+
+async def test_the_audit_log_is_keyed_when_a_key_is_configured(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    key = "k" * 40
+    settings = settings_for(tmp_path, audit_hmac_key=key)
+    app = create_api(checkpoint, settings)
+    async for client in running_client(app):
+        flushed = await client.post("/v1/admin/prefix-cache/flush", headers=headers(ADMIN))
+        assert flushed.status_code == 200
+    path = settings.data_dir / "admin-audit.jsonl"
+    head = flushed.json()["audit_head"]
+    assert AuditLog(path, key=key.encode()).verify(expect_head=head) == head
+    with pytest.raises(AuditChainError):
+        AuditLog(path).verify()
 
 
 def _second_checkpoint(checkpoint: Checkpoint, directory: Path, seed: int) -> str:
@@ -581,7 +653,15 @@ async def test_weight_swap_verifies_the_pinned_manifest_and_is_audited(
         )
         assert after.status_code == 200
     actions = [entry.action for entry in audit.entries()]
-    assert actions == ["weights.swap_rejected", "weights.swap_rejected", "weights.swap"]
+    assert actions == [
+        "weights.swap.requested",
+        "weights.swap_rejected",  # wrong manifest digest
+        "weights.swap.requested",
+        "weights.swap_rejected",  # no such checkpoint
+        "admin.denied",  # not an admin key
+        "weights.swap.requested",
+        "weights.swap",
+    ]
     audit.verify()
 
 
