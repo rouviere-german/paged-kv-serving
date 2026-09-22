@@ -8,7 +8,10 @@ Three properties define it, and each one costs something measurable:
 
 * **Fixed batches.** Requests are taken in arrival order in groups of ``batch_size``, and a group
   starts only once its last member has arrived and the previous group has finished. A request that
-  arrives one moment too late waits for a whole batch.
+  arrives one moment too late waits for a whole batch. With ``max_wait_seconds`` set the engine is
+  the *dynamic* batcher real servers use instead (Triton's ``max_queue_delay``, for example): a
+  batch also leaves, partly filled, once its oldest request has waited that long. That removes the
+  wait-for-a-full-batch cost at low load, and is the fairer baseline for time to first token.
 * **Padded prefill.** Every row of a batch runs the length of the longest prompt in it. The
   padding is real compute; the logits are read at each row's own last real token.
 * **Decode to the longest.** The batch keeps running until its slowest member is done. A row that
@@ -23,6 +26,7 @@ occupancy in the benchmark.
 from __future__ import annotations
 
 import time
+from collections import deque
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
@@ -82,6 +86,7 @@ class StaticBatchingEngine:
         "clock",
         "eos_token_id",
         "max_context_tokens",
+        "max_wait_seconds",
         "model",
         "runner",
         "sleep",
@@ -99,9 +104,12 @@ class StaticBatchingEngine:
         eos_token_id: int | None = None,
         clock: Callable[[], float] = time.perf_counter,
         sleep: Callable[[float], None] = time.sleep,
+        max_wait_seconds: float | None = None,
     ) -> None:
         if batch_size < 1:
             raise ValueError("batch_size must be >= 1")
+        if max_wait_seconds is not None and max_wait_seconds < 0:
+            raise ValueError("max_wait_seconds must be >= 0")
         if max_context_tokens > model.config.max_seq_len:
             raise ValueError("max_context_tokens exceeds the model's max_seq_len")
         self.model = model
@@ -111,6 +119,7 @@ class StaticBatchingEngine:
         self.eos_token_id = eos_token_id
         self.clock = clock
         self.sleep = sleep
+        self.max_wait_seconds = max_wait_seconds
         self.blocks_per_slot = -(-max_context_tokens // block_size)
         self.runner = ModelRunner(
             model, num_blocks=batch_size * self.blocks_per_slot, block_size=block_size
@@ -130,23 +139,46 @@ class StaticBatchingEngine:
     def generate(self, requests: Iterable[Request]) -> list[StaticBatchOutput]:
         """Run every request and return one result per request.
 
-        Arrival times are honoured: a batch waits for its last member, which is what makes the
-        comparison against the continuous engine an open-loop comparison rather than a throughput
-        race on a pre-filled queue.
+        Arrival times are honoured: a batch waits for its last member (or, with a max wait, for
+        its oldest member's wait to run out), which is what makes the comparison against the
+        continuous engine an open-loop comparison rather than a throughput race on a pre-filled
+        queue.
         """
         ordered = sorted(requests, key=lambda item: (item.arrival_time, item.request_id))
         for request in ordered:
             if request.prompt_len + request.sampling.max_new_tokens > self.max_context_tokens:
                 raise ValueError(f"request {request.request_id} exceeds max_context_tokens")
         results: list[StaticBatchOutput] = []
-        for offset in range(0, len(ordered), self.batch_size):
-            group = ordered[offset : offset + self.batch_size]
-            ready_at = max(request.arrival_time for request in group)
-            delay = ready_at - self.clock()
-            if delay > 0:
-                self.sleep(delay)
+        pending = deque(ordered)
+        while pending:
+            group = self._next_batch(pending)
             results.extend(self._run_batch(group))
         return results
+
+    def _next_batch(self, pending: deque[Request]) -> list[Request]:
+        """Wait until the next batch may leave, then take it off ``pending``."""
+        if self.max_wait_seconds is None:
+            group = [pending.popleft() for _ in range(min(self.batch_size, len(pending)))]
+            self._sleep_until(max(request.arrival_time for request in group))
+            return group
+        # Dynamic: leave when full, or when the oldest request has waited max_wait_seconds --
+        # whichever comes first, and never before the previous batch has finished.
+        full_at = (
+            pending[self.batch_size - 1].arrival_time
+            if len(pending) >= self.batch_size
+            else float("inf")
+        )
+        self._sleep_until(min(full_at, pending[0].arrival_time + self.max_wait_seconds))
+        now = self.clock()
+        group = [pending.popleft()]
+        while pending and len(group) < self.batch_size and pending[0].arrival_time <= now:
+            group.append(pending.popleft())
+        return group
+
+    def _sleep_until(self, moment: float) -> None:
+        delay = moment - self.clock()
+        if delay > 0:
+            self.sleep(delay)
 
     def _run_batch(self, group: Sequence[Request]) -> list[StaticBatchOutput]:
         sequences = [EngineSequence.from_request(request, 0) for request in group]
