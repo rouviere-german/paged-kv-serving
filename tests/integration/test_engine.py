@@ -11,6 +11,7 @@ from paged_kv_serving.engine.admission import RejectionReason
 from paged_kv_serving.engine.config import EngineConfig, SloClass
 from paged_kv_serving.engine.engine import Engine, RequestOutput
 from paged_kv_serving.engine.model import LanguageModel
+from paged_kv_serving.engine.sampling import sample_token
 from paged_kv_serving.engine.sequence import (
     FinishReason,
     Request,
@@ -394,3 +395,55 @@ def test_more_samples_than_running_slots_is_refused_up_front(
     assert decision.reason is RejectionReason.TOO_MANY_SAMPLES
     assert engine.active_requests == 0
     assert engine.blocks.num_free_blocks == engine_config.num_blocks
+
+
+def sampled_reference(
+    model: LanguageModel, request: Request, sample_index: int, steps: int
+) -> list[int]:
+    """Sample ``sample_index`` of ``request`` as a cache-free loop with its own generator.
+
+    The generator is the one ``Sequence.from_request`` promises: seeded from the request's seed and
+    the sample index alone, so it cannot depend on the other samples or on the batch.
+    """
+    rng = np.random.default_rng(
+        np.random.SeedSequence(entropy=request.sampling.seed, spawn_key=(sample_index,))
+    )
+    tokens = list(request.prompt_token_ids)
+    produced: list[int] = []
+    for _ in range(steps):
+        token = sample_token(model.reference_forward(tokens)[-1], request.sampling, rng)
+        produced.append(token)
+        tokens.append(token)
+    return produced
+
+
+@pytest.mark.parametrize("num_blocks", [64, 16])
+def test_each_parallel_sample_depends_only_on_the_seed_and_its_index(
+    tiny_model: LanguageModel, engine_config: EngineConfig, num_blocks: int
+) -> None:
+    """Review gap: a fork that reused the parent's generator passed every test.
+
+    Sample ``i`` of an ``n``-way request must equal a standalone run seeded with
+    ``SeedSequence(seed, spawn_key=(i,))`` -- with a roomy pool, and with one small enough that
+    the samples are preempted and recomputed.
+    """
+    config = dataclasses.replace(
+        engine_config, num_blocks=num_blocks, max_running_seqs=12, enable_prefix_cache=False
+    )
+    engine = Engine(tiny_model, config)
+    batch = prompts(3, seed=21, low=18, high=30)
+    requests = [
+        request_for(index, prompt, max_new_tokens=12, n=4, temperature=1.0)
+        for index, prompt in enumerate(batch)
+    ]
+    outputs = {output.request_id: output for output in engine.generate(requests)}
+    if num_blocks == 16:
+        assert engine.scheduler.stats.preemptions > 0, "the small pool must force preemption"
+    for request in requests:
+        samples = outputs[request.request_id].samples
+        assert [sample.sample_index for sample in samples] == [0, 1, 2, 3]
+        for sample in samples:
+            expected = sampled_reference(tiny_model, request, sample.sample_index, steps=12)
+            assert list(sample.token_ids) == expected, (request.request_id, sample.sample_index)
+        assert len({sample.token_ids for sample in samples}) > 1, "samples should differ"
+    engine.check_invariants()
