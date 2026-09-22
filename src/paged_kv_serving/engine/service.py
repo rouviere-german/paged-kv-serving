@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from types import TracebackType
 from typing import TypeVar
@@ -177,7 +177,7 @@ class EngineService:
 
     async def stream(
         self, request_id: str, *, timeout: float | None = None
-    ) -> AsyncIterator[StreamItem]:
+    ) -> AsyncGenerator[StreamItem, None]:
         """Yield this request's tokens and then its summary.
 
         ``timeout`` bounds the whole stream, not each token: when it runs out a single
@@ -227,14 +227,17 @@ class EngineService:
         """Consume a whole stream and return the final summary (None if it was cut short).
 
         Raises :class:`RequestTimeoutError` when ``timeout`` runs out first; the request has
-        already been aborted and its blocks freed by then.
+        already been aborted and its blocks freed by then. That needs the stream closed
+        explicitly: raising out of an ``async for`` leaves the generator suspended, and its
+        ``finally`` -- the abort -- would otherwise wait for garbage collection.
         """
         final: RequestOutput | None = None
-        async for item in self.stream(request_id, timeout=timeout):
-            if item.timed_out:
-                raise RequestTimeoutError(request_id)
-            if item.output is not None:
-                final = item.output
+        async with contextlib.aclosing(self.stream(request_id, timeout=timeout)) as items:
+            async for item in items:
+                if item.timed_out:
+                    raise RequestTimeoutError(request_id)
+                if item.output is not None:
+                    final = item.output
         return final
 
     # --- the loop ------------------------------------------------------------------------

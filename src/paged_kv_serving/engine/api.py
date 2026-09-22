@@ -24,6 +24,7 @@ after; if the intent cannot be written (a tampered chain, a full disk) the actio
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import uuid
 from collections.abc import AsyncIterator, Sequence
@@ -364,6 +365,11 @@ def _install_completion_routes(
         vocab = checkpoint.model.config.vocab_size
         if any(not 0 <= token < vocab for token in token_ids):
             raise AppError(400, "invalid_token", "A prompt token is outside the vocabulary.")
+        if body.deadline_ms is not None and body.deadline_ms > cfg.request_timeout_seconds * 1000:
+            # The hard timeout would abort the request before the deadline it asked for.
+            raise AppError(
+                400, "deadline_too_long", "deadline_ms exceeds the server's request time limit."
+            )
         return EngineRequest(
             request_id=uuid.uuid4().hex,
             prompt_token_ids=tuple(token_ids),
@@ -428,7 +434,7 @@ def _install_completion_routes(
                     reason = decision.reason or RejectionReason.DEADLINE_INFEASIBLE
                     span.set_attribute("engine.outcome", f"rejected:{reason.value}")
                     raise _reject(reason, decision.retry_after_header)
-                timeout = cfg.request_timeout_seconds
+                timeout, expiry = _time_limit(engine_request, cfg, now=engine.clock())
                 if body.stream:
                     handed_off = True
                     return EventSourceResponse(
@@ -438,17 +444,26 @@ def _install_completion_routes(
                             tokenizer,
                             http_request,
                             timeout=timeout,
+                            timeout_code=expiry,
                             span=span,
                         ),
                         ping=15,
                     )
                 try:
-                    output = await service.collect(engine_request.request_id, timeout=timeout)
+                    output = await _collect_unless_disconnected(
+                        service, engine_request.request_id, http_request, timeout=timeout
+                    )
                 except RequestTimeoutError as exc:
-                    span.set_attribute("engine.outcome", "timeout")
-                    raise AppError(
-                        504, "request_timeout", "The request ran past the server's time limit."
-                    ) from exc
+                    span.set_attribute("engine.outcome", expiry)
+                    message = (
+                        "The request ran past its deadline and was aborted."
+                        if expiry == "deadline_exceeded"
+                        else "The request ran past the server's time limit."
+                    )
+                    raise AppError(504, expiry, message) from exc
+                except _ClientGoneError as exc:
+                    span.set_attribute("engine.outcome", "disconnected")
+                    raise AppError(499, "client_disconnected", "The client went away.") from exc
                 if output is None:  # pragma: no cover - only on shutdown mid-request
                     span.set_attribute("engine.outcome", "cancelled")
                     raise AppError(503, "cancelled", "The request did not complete.")
@@ -571,6 +586,57 @@ def _install_admin_routes(
         return {"swapped": body.name, "audit_index": entry.index, "audit_head": entry.digest}
 
 
+def _time_limit(request: EngineRequest, cfg: Settings, *, now: float) -> tuple[float, str]:
+    """Seconds this request may still run, and the error code used when they run out.
+
+    A deadlined request is aborted at its deadline: past it, the answer is late by definition, and
+    finishing it anyway would hold KV blocks for nobody. Otherwise the hard request timeout
+    applies. (The deadline is never longer than the timeout; see ``deadline_too_long``.)
+    """
+    deadline = request.deadline
+    if deadline is None:
+        return cfg.request_timeout_seconds, "request_timeout"
+    return max(0.0, min(cfg.request_timeout_seconds, deadline - now)), "deadline_exceeded"
+
+
+class _ClientGoneError(Exception):
+    """The HTTP client disconnected before a non-streaming answer was ready."""
+
+
+async def _collect_unless_disconnected(
+    service: EngineService,
+    request_id: str,
+    http_request: HttpRequest,
+    *,
+    timeout: float,
+    poll_seconds: float = 0.05,
+) -> RequestOutput | None:
+    """Wait for a whole answer, but stop -- and abort the request -- if the client hangs up.
+
+    A non-streaming request is invisible to the client until it finishes, so without this a
+    caller that gives up keeps its sequences and KV blocks until ``max_tokens`` or the timeout.
+    Cancelling the collector runs :meth:`EngineService.stream`'s ``finally``, which aborts.
+    """
+    collector = asyncio.ensure_future(service.collect(request_id, timeout=timeout))
+
+    async def watch() -> None:
+        while not await http_request.is_disconnected():
+            await asyncio.sleep(poll_seconds)
+
+    watcher = asyncio.ensure_future(watch())
+    try:
+        await asyncio.wait({collector, watcher}, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        watcher.cancel()
+    if collector.done():
+        return collector.result()
+    collector.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await collector
+    _log.info("client_disconnected", request_id=request_id)
+    raise _ClientGoneError(request_id)
+
+
 async def _sse(
     service: EngineService,
     request_id: str,
@@ -578,28 +644,33 @@ async def _sse(
     http_request: HttpRequest,
     *,
     timeout: float | None = None,
+    timeout_code: str = "request_timeout",
     span: Span | None = None,
 ) -> AsyncIterator[dict[str, str]]:
     """Yield one event per token, then a summary and ``[DONE]``.
 
     Breaking out of this generator -- which is what a client disconnect does -- runs the abort in
-    :meth:`EngineService.stream`'s ``finally``. A request that runs past ``timeout`` gets an
-    ``error`` event instead of a summary, and has already been aborted when it is sent.
+    :meth:`EngineService.stream`'s ``finally``. A request that runs past ``timeout`` (its deadline
+    or the hard limit) gets an ``error`` event carrying ``timeout_code`` instead of a summary, and
+    has already been aborted when it is sent.
     """
     outcome = "disconnected"
     try:
-        async for item in service.stream(request_id, timeout=timeout):
-            if await http_request.is_disconnected():
-                break
-            if item.timed_out:
-                outcome = "timeout"
-                yield {"event": "error", "data": json.dumps({"error": "request_timeout"})}
-                continue
-            if item.output is not None and span is not None:
-                _record_output(span, item.output)
-                outcome = "completed"
-            for event in _sse_events(item, tokenizer):
-                yield event
+        # Closed explicitly on every exit, so the stream's abort runs now rather than whenever
+        # the suspended generator happens to be garbage collected.
+        async with contextlib.aclosing(service.stream(request_id, timeout=timeout)) as items:
+            async for item in items:
+                if await http_request.is_disconnected():
+                    break
+                if item.timed_out:
+                    outcome = timeout_code
+                    yield {"event": "error", "data": json.dumps({"error": timeout_code})}
+                    continue
+                if item.output is not None and span is not None:
+                    _record_output(span, item.output)
+                    outcome = "completed"
+                for event in _sse_events(item, tokenizer):
+                    yield event
         yield {"event": "done", "data": "[DONE]"}
     finally:
         if span is not None:

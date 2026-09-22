@@ -91,7 +91,8 @@ class Settings(BaseSettings):
     # Seconds the shutdown hook waits for in-flight requests before stopping the loop.
     drain_timeout_seconds: float = Field(default=20.0, gt=0, le=300)
     # Hard ceiling on one request's wall time, streaming or not. The request is aborted and its
-    # KV blocks freed when it runs out; a deadline_ms shorter than this still applies first.
+    # KV blocks freed when it runs out. A request with deadline_ms is aborted at its deadline
+    # instead, and deadline_ms may not exceed this limit (400 deadline_too_long).
     request_timeout_seconds: float = Field(default=60.0, gt=0, le=3_600)
 
     # --- workload drift ---

@@ -461,6 +461,98 @@ async def test_a_request_over_the_time_limit_is_aborted_and_frees_its_blocks(
         engine.check_invariants()
 
 
+async def test_a_deadline_longer_than_the_request_timeout_is_refused(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review regression: deadline_ms up to 600,000 was accepted under a 60 s hard timeout, so a
+    request could be promised a deadline the server would kill it before reaching."""
+    app = create_api(checkpoint, settings_for(tmp_path, request_timeout_seconds=2.0))
+    async for client in running_client(app):
+        body = {"prompt": "hi", "max_tokens": 2, "deadline_ms": 2_001}
+        response = await client.post("/v1/completions", json=body, headers=headers(USER))
+        assert response.status_code == 400
+        assert response.json()["error"]["code"] == "deadline_too_long"
+        engine = app.state.engine_service.engine
+        assert engine.active_requests == 0
+        ok = await client.post(
+            "/v1/completions", json={**body, "deadline_ms": 2_000}, headers=headers(USER)
+        )
+        assert ok.status_code == 200
+
+
+async def test_a_request_past_its_deadline_is_aborted_at_the_deadline(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review regression: only the 60 s request timeout was enforced, so a request that missed
+    its deadline kept running and holding KV blocks for nobody.
+
+    Admission is fooled on purpose (the latency model believes an iteration takes 3 ms, the
+    executor takes 50 ms), so the request is admitted and then overruns its 200 ms deadline.
+    """
+    settings = settings_for(tmp_path, request_timeout_seconds=30.0)
+    registry = CollectorRegistry()
+    service = slow_service(checkpoint, settings, registry, delay=0.05)
+    app = create_api(checkpoint, settings, service=service, registry=registry)
+    engine = service.engine
+    body = {"prompt": "slow", "max_tokens": 16, "deadline_ms": 200}
+    async for client in running_client(app):
+        started = time.perf_counter()
+        response = await client.post("/v1/completions", json=body, headers=headers(USER))
+        elapsed = time.perf_counter() - started
+        assert response.status_code == 504
+        assert response.json()["error"]["code"] == "deadline_exceeded"
+        assert elapsed < 0.6, elapsed  # 16 tokens at 50 ms each would take about 0.85 s
+        # Forget what the first request taught the latency model, so admission is fooled again.
+        engine.latency.update(engine.latency.intercept, engine.latency.slope)
+        streamed = await client.post(
+            "/v1/completions", json={**body, "stream": True}, headers=headers(USER)
+        )
+        assert streamed.status_code == 200, streamed.text
+        events = sse_events(streamed.text)
+        assert ("error", json.dumps({"error": "deadline_exceeded"})) in events
+        assert "summary" not in [kind for kind, _ in events]
+        for _ in range(100):
+            if engine.active_requests == 0:
+                break
+            await asyncio.sleep(0.01)
+        assert engine.active_requests == 0
+        assert engine.aborted_requests == 2
+        assert not any(sequence.block_table for sequence in engine.live_sequences())
+
+
+def test_hanging_up_on_a_non_streaming_request_aborts_it(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review regression: only the SSE path noticed a disconnect. A client that sent
+    ``stream: false`` and hung up kept its sequences and blocks until max_tokens or the timeout."""
+    settings = settings_for(tmp_path)
+    registry = CollectorRegistry()
+    service = slow_service(checkpoint, settings, registry, delay=0.05)
+    app = create_api(checkpoint, settings, service=service, registry=registry)
+    engine = service.engine
+
+    async def hang_up(base_url: str) -> None:
+        async with httpx.AsyncClient(base_url=base_url, timeout=0.3) as client:
+            with pytest.raises(httpx.ReadTimeout):
+                await client.post(
+                    "/v1/completions",
+                    json={"prompt": "a long answer please", "max_tokens": 16},
+                    headers=headers(USER),
+                )
+        assert engine.active_requests == 1, "the request should still be running at hang-up"
+        for _ in range(300):
+            if engine.active_requests == 0:
+                break
+            await asyncio.sleep(0.01)
+
+    with serve_in_thread(app) as base_url:
+        asyncio.run(hang_up(base_url))
+        assert engine.active_requests == 0
+        assert engine.aborted_requests == 1, "the disconnect must abort, not finish, the request"
+        assert not any(sequence.block_table for sequence in engine.live_sequences())
+        engine.check_invariants()
+
+
 def test_hanging_up_mid_stream_aborts_the_request_and_frees_its_blocks(
     checkpoint: Checkpoint, tmp_path: Path
 ) -> None:
