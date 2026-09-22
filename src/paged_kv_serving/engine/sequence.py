@@ -25,6 +25,7 @@ import numpy as np
 from paged_kv_serving.engine.config import SloClass
 
 __all__ = [
+    "GREEDY_TEMPERATURE",
     "FinishReason",
     "Request",
     "SamplingParams",
@@ -35,6 +36,10 @@ __all__ = [
 ]
 
 _SEQUENCE_COUNTER = itertools.count()
+#: Temperatures below this sample greedily. Dividing float32 logits by a smaller temperature
+#: overflows to inf (and 1e-300 rounds to 0.0 in float32), and the argmax is what such a
+#: temperature asks for anyway.
+GREEDY_TEMPERATURE = 1e-5
 
 
 def new_sequence_id(request_id: str, index: int) -> str:
@@ -58,7 +63,8 @@ class FinishReason(Enum):
 
 @dataclass(frozen=True, slots=True)
 class SamplingParams:
-    """Per-request sampling. ``temperature == 0`` means greedy, which ignores ``top_p``."""
+    """Per-request sampling. A temperature below ``GREEDY_TEMPERATURE`` (including 0) means
+    greedy, which ignores ``top_p``."""
 
     max_new_tokens: int = 32
     temperature: float = 0.0
@@ -78,7 +84,7 @@ class SamplingParams:
 
     @property
     def greedy(self) -> bool:
-        return self.temperature == 0.0
+        return self.temperature < GREEDY_TEMPERATURE
 
 
 @dataclass(frozen=True, slots=True)

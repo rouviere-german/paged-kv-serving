@@ -102,3 +102,24 @@ def test_sampling_parameter_validation() -> None:
             SamplingParams(**kwargs)
     assert SamplingParams(temperature=0.0).greedy
     assert not SamplingParams(temperature=0.1).greedy
+
+
+@pytest.mark.parametrize("temperature", [1e-300, 1e-45, 1e-12, 1e-6])
+def test_a_vanishing_temperature_is_greedy_not_a_division_by_zero(temperature: float) -> None:
+    """Review regression: 1e-300 became 0.0 in float32, the division produced inf and NaN, and
+    the sampler returned the last vocabulary id instead of the argmax."""
+    rng = np.random.default_rng(3)
+    logits = rng.standard_normal(512).astype(np.float32)
+    params = SamplingParams(max_new_tokens=1, temperature=temperature, seed=3)
+    assert params.greedy
+    with np.errstate(divide="raise", over="raise", invalid="raise"):
+        assert sample_token(logits, params, np.random.default_rng(3)) == int(np.argmax(logits))
+
+
+def test_the_smallest_sampling_temperature_is_still_finite() -> None:
+    logits = np.asarray([1.0, 1.0 + 1e-3, 0.5], dtype=np.float32)
+    params = SamplingParams(max_new_tokens=1, temperature=1e-4, seed=0)
+    assert not params.greedy
+    with np.errstate(divide="raise", over="raise", invalid="raise"):
+        token = sample_token(logits, params, np.random.default_rng(0))
+    assert token in (0, 1)
