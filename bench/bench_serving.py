@@ -1,4 +1,4 @@
-"""The serving comparison: continuous batching against static batching on one arrival schedule.
+"""The serving comparison: continuous batching against two batching baselines on one schedule.
 
 Usage:
   uv run python bench/bench_serving.py           # full sweep, writes bench/results/serving.json
@@ -7,9 +7,13 @@ Usage:
 
 Method, and the parts of it that matter:
 
-* **One schedule, two engines.** The arrival times are drawn once per load point from a seeded
-  Poisson process and replayed against both engines, so the two runs see the same work in the same
-  order rather than the same *distribution* of work.
+* **One schedule, three engines.** The arrival times are drawn once per load point from a seeded
+  Poisson process and replayed against the continuous engine, the static batcher (a batch leaves
+  only when full) and the dynamic batcher (a batch also leaves once its oldest request has waited
+  ``DYNAMIC_MAX_WAIT``), so all three see the same work in the same order.
+* **Several seeds, enough requests.** Every load point runs ``REQUESTS_PER_POINT`` requests for
+  each of ``SEEDS``; tables report the mean over seeds, and ratios also their min and max. A p99 of
+  48 samples is its maximum; of 500 it is the fifth largest.
 * **Open loop.** Requests are submitted at their scheduled time whatever the server is doing, and
   every latency is measured from that scheduled time. A slow run therefore looks slow instead of
   quietly lowering its own offered load (coordinated omission).
@@ -83,8 +87,13 @@ ENGINE = EngineConfig(
 #: sequences actually use. Deriving the batch size rather than fixing it is what keeps the
 #: comparison about scheduling instead of about who was given more memory.
 STATIC_BATCH_SIZE = (ENGINE.num_blocks * ENGINE.block_size) // ENGINE.max_context_tokens
+#: The dynamic baseline's max queue delay: long enough to batch under load, short next to the
+#: 1 s interactive deadline.
+DYNAMIC_MAX_WAIT = 0.05
+SEEDS = (17, 18, 19)
+REQUESTS_PER_POINT = 500
 BASE_SPEC = WorkloadSpec(
-    num_requests=48,
+    num_requests=REQUESTS_PER_POINT,
     rate=20.0,
     prompt_tokens=(24, 128),
     max_new_tokens=(4, 32),
@@ -103,6 +112,10 @@ def _engine(checkpoint: Checkpoint, *, prefix_cache: bool = True) -> Engine:
     engine = Engine(checkpoint.model, dataclasses.replace(ENGINE, enable_prefix_cache=prefix_cache))
     engine.profile_latency(repeats=2, warmup=1)
     return engine
+
+
+def replace_seed(spec: WorkloadSpec, seed: int) -> WorkloadSpec:
+    return dataclasses.replace(spec, seed=seed)
 
 
 def measure_capacity(checkpoint: Checkpoint, spec: WorkloadSpec) -> float:
@@ -124,14 +137,16 @@ def measure_capacity(checkpoint: Checkpoint, spec: WorkloadSpec) -> float:
     return len(outputs) / elapsed
 
 
-def _static_row(
-    checkpoint: Checkpoint, requests: list[Request], label: str
+def _batch_row(
+    checkpoint: Checkpoint, requests: list[Request], label: str, *, max_wait: float | None
 ) -> dict[str, float | str]:
+    """One run of a batching baseline: static (``max_wait`` None) or dynamic."""
     static = StaticBatchingEngine(
         checkpoint.model,
         batch_size=STATIC_BATCH_SIZE,
         max_context_tokens=ENGINE.max_context_tokens,
         block_size=ENGINE.block_size,
+        max_wait_seconds=max_wait,
     )
     start = static.clock()
     outputs = static.generate(
@@ -156,7 +171,7 @@ def _static_row(
     latencies = [output.latency for output in outputs]
     return {
         "label": label,
-        "scheduler": "static",
+        "scheduler": "static" if max_wait is None else "dynamic",
         "submitted": float(len(requests)),
         "completed": float(len(outputs)),
         "rejected": 0.0,
@@ -195,18 +210,59 @@ def _continuous_row(
 def load_sweep(
     checkpoint: Checkpoint, capacity: float, multipliers: tuple[float, ...], spec: WorkloadSpec
 ) -> list[dict[str, float | str]]:
-    """Run both schedulers at each multiple of the measured capacity."""
+    """Run the three schedulers at each multiple of the measured capacity, for one seed."""
     rows: list[dict[str, float | str]] = []
     for multiplier in multipliers:
         point = dataclasses.replace(spec, rate=max(capacity * multiplier, 0.1))
         requests = build_workload(point)
         label = f"{multiplier:g}x"
         continuous, _, _ = _continuous_row(checkpoint, requests, label)
-        continuous["offered_rate"] = round(point.rate, 2)
-        static = _static_row(checkpoint, requests, label)
-        static["offered_rate"] = round(point.rate, 2)
-        rows.extend((continuous, static))
+        static = _batch_row(checkpoint, requests, label, max_wait=None)
+        dynamic = _batch_row(checkpoint, requests, label, max_wait=DYNAMIC_MAX_WAIT)
+        for row in (continuous, static, dynamic):
+            row["offered_rate"] = round(point.rate, 2)
+            row["seed"] = float(spec.seed)
+            rows.append(row)
     return rows
+
+
+def spread(values: list[float]) -> dict[str, float]:
+    """Mean, min and max of one metric over seeds."""
+    return {
+        "mean": round(statistics.fmean(values), 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+    }
+
+
+def aggregate_rows(rows: list[dict[str, float | str]]) -> list[dict[str, Any]]:
+    """Per (load, scheduler): the mean over seeds of every numeric column, plus the spread of
+    goodput, SLO attainment and TTFT p99."""
+    groups: dict[tuple[str, str], list[dict[str, float | str]]] = {}
+    for row in rows:
+        groups.setdefault((str(row["label"]), str(row["scheduler"])), []).append(row)
+    aggregated: list[dict[str, Any]] = []
+    for (label, scheduler), members in groups.items():
+        merged: dict[str, Any] = {"label": label, "scheduler": scheduler, "seeds": len(members)}
+        for key, value in members[0].items():
+            if isinstance(value, (int, float)) and key != "seed":
+                merged[key] = round(statistics.fmean(float(m[key]) for m in members), 4)
+        for key in ("goodput_per_second", "slo_attainment", "ttft_p99"):
+            merged[f"{key}_range"] = spread([float(m[key]) for m in members])
+        aggregated.append(merged)
+    return aggregated
+
+
+def aggregate_ratios(per_seed: list[dict[str, float]]) -> tuple[dict[str, float], dict[str, Any]]:
+    """Mean of each ratio over seeds (what the thresholds check) and its full spread."""
+    means: dict[str, float] = {}
+    ranges: dict[str, Any] = {}
+    for key in per_seed[0]:
+        values = [ratios_of_seed[key] for ratios_of_seed in per_seed]
+        summary = spread(values)
+        means[key] = summary["mean"]
+        ranges[key] = {**summary, "per_seed": values}
+    return means, ranges
 
 
 def prefix_cache_effect(checkpoint: Checkpoint, spec: WorkloadSpec) -> dict[str, float]:
@@ -245,6 +301,19 @@ def prefix_cache_effect(checkpoint: Checkpoint, spec: WorkloadSpec) -> dict[str,
         1.0 - measured["prefill_tokens_on"] / max(measured["prefill_tokens_off"], 1.0), 4
     )
     return measured
+
+
+def prefix_cache_over_seeds(
+    checkpoint: Checkpoint, spec: WorkloadSpec, seeds: tuple[int, ...]
+) -> dict[str, Any]:
+    """:func:`prefix_cache_effect` per seed; the top-level values are means over seeds."""
+    runs = [prefix_cache_effect(checkpoint, dataclasses.replace(spec, seed=s)) for s in seeds]
+    summary: dict[str, Any] = {
+        key: round(statistics.fmean(run[key] for run in runs), 5) for key in runs[0]
+    }
+    summary["ttft_p50_reduction_range"] = spread([run["ttft_p50_reduction"] for run in runs])
+    summary["per_seed"] = runs
+    return summary
 
 
 def memory_utilization(checkpoint: Checkpoint, spec: WorkloadSpec) -> dict[str, float]:
@@ -353,16 +422,22 @@ def ratios(rows: list[dict[str, float | str]]) -> dict[str, float]:
     by_label: dict[str, dict[str, dict[str, float | str]]] = {}
     for row in rows:
         by_label.setdefault(str(row["label"]), {})[str(row["scheduler"])] = row
-    for label, pair in by_label.items():
-        if {"continuous", "static"} - set(pair):  # pragma: no cover - both are always present
-            continue
-        continuous, static = pair["continuous"], pair["static"]
-        for metric in ("goodput_per_second", "tokens_per_second"):
-            denominator = float(static[metric]) or 1e-9
-            out[f"{label}_{metric}_ratio"] = round(float(continuous[metric]) / denominator, 3)
-        out[f"{label}_ttft_p99_ratio"] = round(
-            float(static["ttft_p99"]) / max(float(continuous["ttft_p99"]), 1e-9), 3
-        )
+    for label, group in by_label.items():
+        continuous = group["continuous"]
+        # "_ratio" compares against static batching, "_ratio_vs_dynamic" against the max-wait
+        # dynamic batcher; both baselines ran the same arrivals.
+        for baseline, suffix in (("static", ""), ("dynamic", "_vs_dynamic")):
+            if baseline not in group:  # pragma: no cover - every baseline always runs
+                continue
+            other = group[baseline]
+            for metric in ("goodput_per_second", "tokens_per_second"):
+                denominator = float(other[metric]) or 1e-9
+                out[f"{label}_{metric}_ratio{suffix}"] = round(
+                    float(continuous[metric]) / denominator, 3
+                )
+            out[f"{label}_ttft_p99_ratio{suffix}"] = round(
+                float(other["ttft_p99"]) / max(float(continuous["ttft_p99"]), 1e-9), 3
+            )
     return out
 
 
@@ -436,6 +511,7 @@ def _lookup(payload: dict[str, Any], path: str) -> float | None:
 
 def run(*, quick: bool) -> dict[str, Any]:
     multipliers = (1.0, 1.5) if quick else (0.5, 1.0, 1.5, 3.0)
+    seeds = SEEDS[:1] if quick else SEEDS
     spec = dataclasses.replace(BASE_SPEC, num_requests=16 if quick else BASE_SPEC.num_requests)
     blas = limit_blas_threads(1)
     with tempfile.TemporaryDirectory() as tmp:
@@ -446,7 +522,13 @@ def run(*, quick: bool) -> dict[str, Any]:
         capacity = statistics.median(
             measure_capacity(checkpoint, spec) for _ in range(1 if quick else 3)
         )
-        rows = load_sweep(checkpoint, capacity, multipliers, spec)
+        rows: list[dict[str, float | str]] = []
+        per_seed: list[dict[str, float]] = []
+        for seed in seeds:
+            seed_rows = load_sweep(checkpoint, capacity, multipliers, replace_seed(spec, seed))
+            rows.extend(seed_rows)
+            per_seed.append(ratios(seed_rows))
+        mean_ratios, ratio_ranges = aggregate_ratios(per_seed)
         payload: dict[str, Any] = {
             "machine": machine(),
             "model": {
@@ -459,9 +541,14 @@ def run(*, quick: bool) -> dict[str, Any]:
             "static_batch_size": STATIC_BATCH_SIZE,
             "kv_tokens_per_scheduler": ENGINE.num_blocks * ENGINE.block_size,
             "capacity_requests_per_second": round(capacity, 2),
+            "seeds": list(seeds),
+            "requests_per_point": spec.num_requests,
+            "dynamic_max_wait_seconds": DYNAMIC_MAX_WAIT,
+            "load_sweep_mean": aggregate_rows(rows),
+            "ratios": mean_ratios,
+            "ratio_ranges": ratio_ranges,
             "load_sweep": rows,
-            "ratios": ratios(rows),
-            "prefix_cache": prefix_cache_effect(checkpoint, spec),
+            "prefix_cache": prefix_cache_over_seeds(checkpoint, spec, seeds),
             "memory": memory_utilization(checkpoint, spec),
             "admission": admission_accuracy(checkpoint),
             "bench_seconds": round(time.perf_counter() - started, 1),
@@ -472,7 +559,9 @@ def run(*, quick: bool) -> dict[str, Any]:
             params={
                 "engine": dataclasses.asdict(ENGINE),
                 "static_batch_size": STATIC_BATCH_SIZE,
-                "workload_seed": spec.seed,
+                "dynamic_max_wait_seconds": DYNAMIC_MAX_WAIT,
+                "workload_seeds": list(seeds),
+                "requests_per_point": spec.num_requests,
                 "quick": quick,
             },
             metrics={key: float(value) for key, value in payload["ratios"].items()},
@@ -480,26 +569,34 @@ def run(*, quick: bool) -> dict[str, Any]:
     return payload
 
 
+def _range(cell: dict[str, float]) -> str:
+    return f"{cell['mean']} ({cell['min']}-{cell['max']})"
+
+
 def _print_table(payload: dict[str, Any]) -> None:
     print(f"capacity (continuous, saturated): {payload['capacity_requests_per_second']} req/s")
+    print(
+        f"seeds {payload['seeds']}, {payload['requests_per_point']} requests per load point; "
+        "means over seeds (min-max)"
+    )
     print()
     print(
         "| load | scheduler | completed | rejected | tokens/s | TTFT p50 | TTFT p99 "
         "| latency p99 | SLO | goodput/s |"
     )
     print("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|")
-    for row in payload["load_sweep"]:
+    for row in payload["load_sweep_mean"]:
         print(
-            f"| {row['label']} | {row['scheduler']} | {row['completed']:.0f} "
-            f"| {row['rejected']:.0f} | {row['tokens_per_second']} | {row['ttft_p50']} "
-            f"| {row['ttft_p99']} | {row['latency_p99']} | {row['slo_attainment']} "
-            f"| {row['goodput_per_second']} |"
+            f"| {row['label']} | {row['scheduler']} | {row['completed']:.1f} "
+            f"| {row['rejected']:.1f} | {row['tokens_per_second']} | {row['ttft_p50']} "
+            f"| {_range(row['ttft_p99_range'])} | {row['latency_p99']} "
+            f"| {_range(row['slo_attainment_range'])} | {_range(row['goodput_per_second_range'])} |"
         )
     print()
-    print("| ratio (continuous / static) | value |")
-    print("|---|---:|")
-    for key, value in payload["ratios"].items():
-        print(f"| {key} | {value} |")
+    print("| ratio (continuous / baseline) | mean | min | max |")
+    print("|---|---:|---:|---:|")
+    for key, value in payload["ratio_ranges"].items():
+        print(f"| {key} | {value['mean']} | {value['min']} | {value['max']} |")
     print()
     cache = payload["prefix_cache"]
     print("| prefix cache (shared system prompt) | off | on |")
@@ -509,9 +606,11 @@ def _print_table(payload: dict[str, Any]) -> None:
         f"| prefill tokens | {cache['prefill_tokens_off']:.0f} | {cache['prefill_tokens_on']:.0f} |"
     )
     print(f"| block hit ratio | {cache['hit_ratio_off']} | {cache['hit_ratio_on']} |")
+    reduction = cache["ttft_p50_reduction_range"]
     print(
         f"| TTFT p50 reduction | | {cache['ttft_p50_reduction']:.1%} "
-        f"(prefill tokens saved {cache['prefill_tokens_saved']:.1%}) |"
+        f"(range {reduction['min']:.1%}-{reduction['max']:.1%}; "
+        f"prefill tokens saved {cache['prefill_tokens_saved']:.1%}) |"
     )
     print()
     memory = payload["memory"]

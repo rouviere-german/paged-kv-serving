@@ -1,5 +1,5 @@
 {
-  "_comment": "Floors and ceilings for bench/bench_serving.py --check. Paths index into bench/results/serving.json with '/' (the keys themselves contain dots). Timing-derived ratios are set well below the values measured on the development machine (Windows 10, 6 CPUs, CPython 3.12, numpy 2.x, BLAS pinned to one thread) because shared CI runners are noisy: they catch a design regression, not a few percent of drift. The admission and memory rows do not depend on timing and are tight.",
+  "_comment": "Floors and ceilings for bench/bench_serving.py --check. Paths index into bench/results/serving.json with '/' (the keys themselves contain dots). Ratios are means over the seeds; '_vs_dynamic' compares against the max-wait dynamic batcher, the rest against static batching. Timing-derived ratios are set well below the values measured on the development machine (Windows 10, 6 CPUs, CPython 3.12, numpy 2.x, BLAS pinned to one thread) because shared CI runners are noisy: they catch a design regression, not a few percent of drift. The admission and memory rows do not depend on timing and are tight. bench_seconds is a runaway guard for the 3-seed, 500-request sweep, not a performance claim.",
   "min": {
     "ratios/1.5x_goodput_per_second_ratio": 1.5,
     "ratios/3x_goodput_per_second_ratio": 1.5,
@@ -8,12 +8,15 @@
     "prefix_cache/hit_ratio_on": 0.5,
     "prefix_cache/ttft_p50_reduction": 0.3,
     "memory/paged_mean_utilization": 0.8,
-    "capacity_requests_per_second": 5.0
+    "capacity_requests_per_second": 5.0,
+    "ratios/1.5x_goodput_per_second_ratio_vs_dynamic": 1.5,
+    "ratios/1.5x_tokens_per_second_ratio": 1.3,
+    "ratios/1.5x_tokens_per_second_ratio_vs_dynamic": 1.3
   },
   "max": {
     "prefix_cache/hit_ratio_off": 0.0,
     "admission/admitted_missed_total": 0,
     "memory/static_end_of_batch_utilization": 0.6,
-    "bench_seconds": 600
+    "bench_seconds": 1200
   }
 }

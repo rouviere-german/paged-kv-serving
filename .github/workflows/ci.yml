@@ -99,7 +99,9 @@ jobs:
   bench:
     name: bench (regression thresholds)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The serving sweep runs 3 seeds x 500 requests x 4 loads x 3 schedulers (about 10 minutes
+    # on the development machine).
+    timeout-minutes: 45
     env:
       OPENBLAS_NUM_THREADS: "1"
     steps:
