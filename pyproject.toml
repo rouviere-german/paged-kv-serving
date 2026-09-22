@@ -1,0 +1,128 @@
+[project]
+name = "paged-kv-serving"
+version = "0.1.0"
+description = "A from-scratch CPU inference engine for a tiny transformer: paged KV cache, continuous batching, block-level prefix caching and deadline-aware admission, measured against static batching."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rouviere German" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # --- core (every repo) ---
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.7",
+    "structlog>=24.4",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "prometheus-client>=0.21",
+    # --- ml kit ---
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "pandera[pandas]>=0.24",
+    # --- serving engine ---
+    "safetensors>=0.4",
+    "sse-starlette>=2.1",
+    "httpx>=0.27",
+    "threadpoolctl>=3.5",
+]
+
+[project.scripts]
+paged-kv-serving = "paged_kv_serving.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "pytest-asyncio>=0.24",
+    "hypothesis>=6.115",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "pandas-stubs>=2.2",
+    "bandit[toml]>=1.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+# Baseline metadata consumed by scripts/check_baseline.py.
+# kind: "template" (both kits), "agentic" or "ml".
+[tool.portfolio]
+kind = "ml"
+package = "paged_kv_serving"
+
+# pip-audit has no native config file; tasks.py and CI read this list.
+# Every entry needs a justification and a review date.
+[tool.portfolio.audit]
+ignore_vulns = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts", "bench"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "S", "N", "SIM", "C4", "RUF", "PT", "PL", "TRY", "BLE", "DTZ", "T20",
+]
+ignore = [
+    "PLR0913",  # explicit keyword-heavy constructors are fine
+    "PLR2004",  # magic numbers in tests and thresholds
+    "TRY003",   # messages in exception constructors are fine
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311", "PLR2004", "PLC0415", "S603"]
+"scripts/**" = ["T201"]
+"bench/**" = ["T201", "S311"]
+"tasks.py" = ["T201", "S603", "S607"]
+"src/paged_kv_serving/cli.py" = ["T201"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests", "scripts", "bench", "tasks.py"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["safetensors.*", "sse_starlette.*", "threadpoolctl"]
+# safetensors and sse-starlette ship hints without a py.typed marker on every submodule;
+# threadpoolctl ships none. Only two of its functions are used (engine/threads.py).
+follow_imports = "silent"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "unit: fast, isolated tests with no I/O beyond tmp_path",
+    "integration: tests that wire several components (app, files, CLI) together",
+]
+filterwarnings = ["error::DeprecationWarning:paged_kv_serving.*"]
+
+[tool.coverage.run]
+source = ["paged_kv_serving"]
+branch = true
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = []

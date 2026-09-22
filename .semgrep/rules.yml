@@ -1,0 +1,112 @@
+# Repository-specific semgrep rules, run in CI next to the p/python and p/secrets registry packs.
+rules:
+  - id: no-pickle-family-serialization
+    languages: [python]
+    severity: ERROR
+    message: >-
+      pickle-compatible formats execute code on load. Use JSON, npz with allow_pickle=False,
+      safetensors or faiss write_index instead.
+    pattern-either:
+      - pattern: import pickle
+      - pattern: import cPickle
+      - pattern: import dill
+      - pattern: import joblib
+      - pattern: import cloudpickle
+      - pattern: import shelve
+      - pattern: import _pickle
+      - pattern: from pickle import $X
+      - pattern: from _pickle import $X
+      - pattern: from cPickle import $X
+      - pattern: from dill import $X
+      - pattern: from joblib import $X
+      - pattern: from cloudpickle import $X
+      - pattern: from shelve import $X
+
+  - id: pandas-pickle-io
+    languages: [python]
+    severity: ERROR
+    message: pandas read_pickle/to_pickle use pickle; use Parquet, CSV or JSON instead.
+    pattern-either:
+      - pattern: pandas.read_pickle(...)
+      - pattern: $FRAME.to_pickle(...)
+
+  - id: numpy-load-allow-pickle
+    languages: [python]
+    severity: ERROR
+    message: numpy.load must keep allow_pickle=False.
+    pattern: numpy.load(..., allow_pickle=True, ...)
+
+  - id: torch-load-without-weights-only
+    languages: [python]
+    severity: ERROR
+    message: torch.load unpickles by default; pass weights_only=True or use safetensors.
+    patterns:
+      - pattern: torch.load(...)
+      - pattern-not: torch.load(..., weights_only=True, ...)
+
+  - id: yaml-unsafe-load
+    languages: [python]
+    severity: ERROR
+    message: Use yaml.safe_load (yaml.load can construct arbitrary objects).
+    patterns:
+      - pattern: yaml.load(...)
+      - pattern-not: yaml.load(..., Loader=yaml.SafeLoader, ...)
+      - pattern-not: yaml.load(..., Loader=yaml.CSafeLoader, ...)
+
+  - id: no-eval-or-exec
+    languages: [python]
+    severity: ERROR
+    message: eval/exec on dynamic input is code injection.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+
+  - id: subprocess-shell-true
+    languages: [python]
+    severity: ERROR
+    message: shell=True enables command injection; pass an argument list.
+    pattern: subprocess.$FUNC(..., shell=True, ...)
+
+  - id: tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: TLS certificate verification must stay enabled.
+    pattern: $CLIENT(..., verify=False, ...)
+
+  - id: hmac-digest-compared-with-equality
+    languages: [python]
+    severity: ERROR
+    message: Compare MACs with hmac.compare_digest to avoid timing leaks.
+    pattern-either:
+      - pattern: hmac.new(...).hexdigest() == $X
+      - pattern: $X == hmac.new(...).hexdigest()
+      - pattern: hmac.new(...).digest() == $X
+      - pattern: $X == hmac.new(...).digest()
+
+  - id: cors-wildcard-origin
+    languages: [python]
+    severity: ERROR
+    message: CORS must list explicit origins.
+    pattern: $APP.add_middleware(CORSMiddleware, ..., allow_origins=["*"], ...)
+
+  - id: claude-removed-sampling-parameters
+    languages: [python]
+    severity: ERROR
+    message: >-
+      temperature, top_p, top_k and thinking.budget_tokens are rejected by current Claude models;
+      use adaptive thinking and output_config.effort.
+    pattern-either:
+      - pattern: $C.messages.create(..., temperature=$V, ...)
+      - pattern: $C.beta.messages.create(..., temperature=$V, ...)
+      - pattern: $C.messages.create(..., top_p=$V, ...)
+      - pattern: $C.beta.messages.create(..., top_p=$V, ...)
+      - pattern: '{..., "budget_tokens": $V, ...}'
+
+  - id: hardcoded-anthropic-api-key
+    languages: [generic]
+    severity: ERROR
+    message: Anthropic API keys must come from the environment, never from source.
+    pattern-regex: sk-ant-[A-Za-z0-9_-]{20,}
+    paths:
+      exclude:
+        - "tests/**"
