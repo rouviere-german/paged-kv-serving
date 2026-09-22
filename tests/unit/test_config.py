@@ -85,3 +85,12 @@ def test_get_settings_is_cached() -> None:
         assert get_settings() is get_settings()
     finally:
         get_settings.cache_clear()
+
+
+def test_the_audit_key_is_secret_optional_and_long_enough() -> None:
+    assert Settings(_env_file=None, audit_hmac_key="").audit_hmac_key is None
+    settings = Settings(_env_file=None, audit_hmac_key="k" * 32)
+    assert settings.audit_hmac_key is not None
+    assert "k" * 32 not in repr(settings)
+    with pytest.raises(ValueError, match="at least 32"):
+        Settings(_env_file=None, audit_hmac_key="short")

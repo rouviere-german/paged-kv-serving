@@ -13,7 +13,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 __all__ = ["Settings", "get_settings"]
@@ -108,8 +108,13 @@ class Settings(BaseSettings):
 
     # --- storage ---
     data_dir: Path = Path("var")
+    # HMAC key for the admin audit chain. Unset: plain SHA-256, which anybody who can write the
+    # file can recompute. Set: rewriting the chain needs this secret as well.
+    audit_hmac_key: SecretStr | None = Field(default=None, min_length=32)
 
-    @field_validator("engine_blas_threads", "checkpoint_manifest_sha256", mode="before")
+    @field_validator(
+        "engine_blas_threads", "checkpoint_manifest_sha256", "audit_hmac_key", mode="before"
+    )
     @classmethod
     def _empty_is_none(cls, value: object) -> object:
         return None if isinstance(value, str) and not value.strip() else value

@@ -19,6 +19,8 @@ services:
       APP_LOG_LEVEL: INFO
       APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
       APP_KEY_POLICIES: ${APP_KEY_POLICIES:-}
+      # HMAC key for the admin audit chain (32+ characters); empty keeps plain SHA-256.
+      APP_AUDIT_HMAC_KEY: ${APP_AUDIT_HMAC_KEY:-}
       # Digest of the checkpoint built into the image (deterministic: seeded weights, fixed
       # timestamp). A checkpoint whose manifest does not match is refused at start-up.
       APP_CHECKPOINT_MANIFEST_SHA256: ${APP_CHECKPOINT_MANIFEST_SHA256:-cf6912e1dfedf43fa7caebef4b46f4c06f2fe57f13c44c514097dfd50a1edb2f}

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
 import json
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
+from paged_kv_serving.core.canonical import canonical_json, sha256_hex
+from paged_kv_serving.core.logging import configure_logging
 from paged_kv_serving.engine.audit import (
     GENESIS,
     AuditChainError,
@@ -144,9 +147,87 @@ def test_an_entry_knows_its_own_expected_digest() -> None:
 def test_the_cli_reports_ok_and_failure(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     audit = log(tmp_path)
     head = audit.append("key-a", "prefix_cache.flush", {}).digest
+    capsys.readouterr()  # the append's own audit_appended log event
     assert main(["verify", str(audit.path), "--expect-head", head]) == 0
     assert json.loads(capsys.readouterr().out) == {"ok": True, "head": head}
     assert main(["verify", str(audit.path), "--expect-head", GENESIS]) == 1
     assert json.loads(capsys.readouterr().out)["ok"] is False
     assert main(["verify", str(tmp_path / "missing.jsonl")]) == 0  # an absent log is empty
     capsys.readouterr()
+
+
+KEY = b"an audit key that lives outside the log file"
+
+
+def _rebuild_without_key(path: Path, *, released_blocks: int) -> None:
+    """What somebody who can write the file (but not read the key) does to rewrite history."""
+    entries = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    entries[0]["detail"]["released_blocks"] = released_blocks
+    previous = GENESIS
+    for entry in entries:
+        entry["previous"] = previous
+        payload = {name: entry[name] for name in entry if name != "digest"}
+        entry["digest"] = previous = sha256_hex(canonical_json(payload))
+    lines = [json.dumps(entry, sort_keys=True) + "\n" for entry in entries]
+    path.write_text("".join(lines), encoding="utf-8")
+
+
+def test_an_unkeyed_chain_can_be_rebuilt_by_anyone_who_can_write_it(tmp_path: Path) -> None:
+    audit = log(tmp_path)
+    audit.append("key-a", "prefix_cache.flush", {"released_blocks": 3})
+    audit.append("key-a", "weights.swap", {"name": "v2"})
+    _rebuild_without_key(audit.path, released_blocks=0)
+    audit.verify()  # passes: this is why the head has to be anchored somewhere else
+
+
+def test_a_keyed_chain_cannot_be_rebuilt_without_the_key(tmp_path: Path) -> None:
+    """Review gap: the chain was an unkeyed SHA-256, so editing and re-hashing went unnoticed.
+
+    With a key, every digest is an HMAC; a rebuilt chain, a missing key and a wrong key all fail.
+    """
+    audit = AuditLog(tmp_path / "audit.jsonl", key=KEY)
+    first = audit.append("key-a", "prefix_cache.flush", {"released_blocks": 3})
+    head = audit.append("key-a", "weights.swap", {"name": "v2"}).digest
+    assert first.digest != first.expected_digest(), "an HMAC is not the plain SHA-256"
+    assert audit.verify(expect_head=head) == head
+    with pytest.raises(AuditChainError):
+        AuditLog(audit.path).verify()
+    with pytest.raises(AuditChainError):
+        AuditLog(audit.path, key=b"x" * 32).verify()
+    _rebuild_without_key(audit.path, released_blocks=0)
+    with pytest.raises(AuditChainError, match="modified"):
+        audit.verify()
+    with pytest.raises(AuditChainError):
+        audit.append("key-a", "prefix_cache.flush", {})
+
+
+def test_the_cli_verifies_a_keyed_chain_with_the_key_from_the_environment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    audit = AuditLog(tmp_path / "audit.jsonl", key=KEY)
+    head = audit.append("key-a", "prefix_cache.flush", {}).digest
+    assert main(["verify", str(audit.path)]) == 1
+    capsys.readouterr()
+    monkeypatch.setenv("APP_AUDIT_HMAC_KEY", KEY.decode())
+    assert main(["verify", str(audit.path), "--expect-head", head]) == 0
+    assert json.loads(capsys.readouterr().out) == {"ok": True, "head": head}
+
+
+@pytest.mark.usefixtures("restore_logging")
+def test_every_append_publishes_the_new_head_to_the_log_stream(tmp_path: Path) -> None:
+    """Review gap: truncation is only detectable against a head kept somewhere else, and the
+    server never wrote the head anywhere but the admin response. Each append now logs it, so the
+    log pipeline holds an anchor the audit file's writer cannot rewrite."""
+    stream = io.StringIO()
+    configure_logging("INFO", stream=stream)
+    audit = log(tmp_path)
+    first = audit.append("key-a", "prefix_cache.flush", {"released_blocks": 3})
+    second = audit.append("key-a", "weights.swap", {"name": "v2"})
+    lines = [
+        json.loads(line) for line in stream.getvalue().splitlines() if "audit_appended" in line
+    ]
+    assert [(line["index"], line["head"]) for line in lines] == [
+        (0, first.digest),
+        (1, second.digest),
+    ]
+    assert all("detail" not in line for line in lines)
