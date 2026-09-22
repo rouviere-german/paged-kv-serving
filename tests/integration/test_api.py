@@ -260,6 +260,27 @@ async def test_authentication_and_entitlements_are_enforced(
     assert allowed.status_code == 200
 
 
+async def test_keys_without_any_policies_cannot_use_the_engine(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review regression: with API keys configured and no policies at all, entitlements were
+    switched off and every valid key got interactive, parallel samples and no token or
+    concurrency limit."""
+    app = create_api(checkpoint, settings_for(tmp_path, key_policies=[]))
+    async for client in running_client(app):
+        for body in (
+            {"prompt": "hi", "max_tokens": 2},
+            {"prompt": "hi", "max_tokens": 2, "slo_class": "batch"},
+            {"prompt": "hi", "max_tokens": 2, "n": 4, "temperature": 1.0},
+        ):
+            response = await client.post("/v1/completions", json=body, headers=headers(USER))
+            assert response.status_code == 403, body
+            assert response.json()["error"]["code"] == "class_not_entitled"
+        engine = app.state.engine_service.engine
+        assert engine.entitlements is not None
+        assert engine.active_requests == 0
+
+
 async def test_prompt_and_output_ceilings_are_hard_limits(
     api: tuple[httpx.AsyncClient, Any],
 ) -> None:

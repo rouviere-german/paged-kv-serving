@@ -184,15 +184,26 @@ def build_service(
     *,
     registry: CollectorRegistry | None = None,
 ) -> EngineService:
-    """Wire a verified checkpoint, the configured limits and the entitlements into a service."""
+    """Wire a verified checkpoint, the configured limits and the entitlements into a service.
+
+    The entitlement guard is installed unconditionally. An empty policy store denies every key,
+    which is the safe reading of "no policies configured"; leaving the guard out instead would
+    hand every authenticated key the interactive class, parallel sampling and no token or
+    concurrency limit at all.
+    """
     store = parse_key_policies(settings.key_policies)
+    if settings.api_key_sha256 and not len(store):
+        _log.warning(
+            "no_key_policies",
+            detail="API keys are configured but APP_KEY_POLICIES is empty: every key is denied",
+        )
     engine = Engine(
         checkpoint.model,
         _engine_config(settings),
         eos_token_id=checkpoint.tokenizer.eos_token_id,
         metrics=create_engine_metrics(registry),
         prefix_cache_scope=settings.engine_prefix_cache_scope,
-        entitlements=EntitlementGuard(store) if len(store) else None,
+        entitlements=EntitlementGuard(store),
         drift_monitor=PromptLengthMonitor.learning(
             settings.drift_reference_size, window=settings.drift_window
         ),
