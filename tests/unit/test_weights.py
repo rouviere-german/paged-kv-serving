@@ -140,3 +140,44 @@ def test_the_checkpoint_format_contains_no_pickle(written: Path) -> None:
     header_length = int.from_bytes(raw[:8], "little")
     header = json.loads(raw[8 : 8 + header_length])
     assert all(entry["dtype"] == "F32" for entry in header.values() if isinstance(entry, dict))
+
+
+def _rewrite_manifest(directory: Path, **changes: object) -> None:
+    path = directory / MANIFEST_FILE
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.update(changes)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+
+@pytest.mark.parametrize("kept", [(), (TOKENIZER_FILE,), (WEIGHTS_FILE,)])
+def test_a_manifest_must_cover_the_weights_and_the_tokenizer(
+    written: Path, kept: tuple[str, ...]
+) -> None:
+    """Review regression: a manifest listing no artifacts vouched for any weights at all.
+
+    With ``artifacts`` emptied and the weights edited, the checkpoint used to load.
+    """
+    data = json.loads((written / MANIFEST_FILE).read_text(encoding="utf-8"))
+    _rewrite_manifest(
+        written, artifacts=[item for item in data["artifacts"] if item["name"] in kept]
+    )
+    with pytest.raises(CheckpointIntegrityError, match="does not cover"):
+        load_checkpoint(written)
+
+
+@pytest.mark.parametrize(
+    "name", ["../weights.safetensors", "sub/weights.safetensors", "a\\b", "..", ".hidden", ""]
+)
+def test_artifact_names_are_plain_file_names(written: Path, name: str) -> None:
+    data = json.loads((written / MANIFEST_FILE).read_text(encoding="utf-8"))
+    extra = {**data["artifacts"][0], "name": name}
+    _rewrite_manifest(written, artifacts=[*data["artifacts"], extra])
+    with pytest.raises(ValueError, match=r"plain file name|validation error"):
+        load_checkpoint(written)
+
+
+def test_an_artifact_may_not_be_listed_twice(written: Path) -> None:
+    data = json.loads((written / MANIFEST_FILE).read_text(encoding="utf-8"))
+    _rewrite_manifest(written, artifacts=[*data["artifacts"], data["artifacts"][0]])
+    with pytest.raises(ValueError, match="more than once"):
+        load_checkpoint(written)

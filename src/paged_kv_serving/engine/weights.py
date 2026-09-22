@@ -8,13 +8,17 @@ with no opcodes to interpret -- and the tokenizer is plain JSON.
 
 Format alone is not integrity, so a checkpoint also carries ``manifest.json``: the model shape,
 the parameter count, and the SHA-256 and size of every other file. :func:`load_checkpoint`
-recomputes those digests and refuses the checkpoint on any mismatch. The manifest is the root of
+recomputes those digests and refuses the checkpoint on any mismatch -- and refuses a manifest that
+does not list the weights and the tokenizer at all, since a manifest that vouches for nothing would
+otherwise pass every check it contains. Artifact names are plain file names, so a manifest cannot
+point verification at a file outside the checkpoint directory. The manifest is the root of
 that trust and is not self-protecting, so a deployment that cares pins its digest out of band and
 passes it as ``expect_manifest_sha256``; the admin weight-swap endpoint requires exactly that.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -22,7 +26,7 @@ from pathlib import Path
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator
 from safetensors.numpy import load_file, save_file
 
 from paged_kv_serving.core.canonical import canonical_json, sha256_hex
@@ -35,6 +39,7 @@ from paged_kv_serving.ml.manifest import sha256_file
 
 __all__ = [
     "MANIFEST_FILE",
+    "REQUIRED_ARTIFACTS",
     "TOKENIZER_FILE",
     "WEIGHTS_FILE",
     "ArtifactDigest",
@@ -49,6 +54,11 @@ __all__ = [
 WEIGHTS_FILE = "weights.safetensors"
 TOKENIZER_FILE = "tokenizer.json"
 MANIFEST_FILE = "manifest.json"
+#: Files a loadable checkpoint must have digests for. Everything else a manifest lists is checked
+#: too, but these are the ones load_checkpoint parses.
+REQUIRED_ARTIFACTS = (WEIGHTS_FILE, TOKENIZER_FILE)
+# No separators, no leading dot (so neither ".." nor hidden files), bounded length.
+_PLAIN_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 class CheckpointIntegrityError(ValueError):
@@ -62,6 +72,13 @@ class ArtifactDigest(BaseModel):
     sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
     size_bytes: int = Field(ge=0)
 
+    @field_validator("name")
+    @classmethod
+    def _plain_file_name(cls, value: str) -> str:
+        if not _PLAIN_FILE_NAME.fullmatch(value) or ".." in value:
+            raise ValueError("an artifact name must be a plain file name inside the checkpoint")
+        return value
+
 
 class WeightsManifest(BaseModel):
     """What a checkpoint claims to be, and the digests that prove the files match."""
@@ -74,6 +91,14 @@ class WeightsManifest(BaseModel):
     parameter_count: int = Field(ge=1)
     tokenizer_vocab_size: int = Field(ge=1)
     artifacts: tuple[ArtifactDigest, ...]
+
+    @field_validator("artifacts")
+    @classmethod
+    def _unique_names(cls, value: tuple[ArtifactDigest, ...]) -> tuple[ArtifactDigest, ...]:
+        names = [artifact.name for artifact in value]
+        if len(names) != len(set(names)):
+            raise ValueError("an artifact is listed more than once")
+        return value
 
     def sha256(self) -> str:
         """Digest of the manifest itself: the value to pin out of band."""
@@ -152,6 +177,8 @@ def load_checkpoint(directory: Path, *, expect_manifest_sha256: str | None = Non
     manifest = WeightsManifest.load(manifest_path)
     if expect_manifest_sha256 is not None and manifest.sha256() != expect_manifest_sha256:
         raise CheckpointIntegrityError("manifest digest does not match the pinned value")
+    for name in REQUIRED_ARTIFACTS:
+        manifest.digest_of(name)  # raises when the manifest does not vouch for a file we parse
     for artifact in manifest.artifacts:
         path = directory / artifact.name
         if not path.is_file():
