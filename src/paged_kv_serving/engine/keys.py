@@ -8,11 +8,13 @@ per key rather than detected.
 
 Three independent limits, because they fail differently:
 
-* ``max_concurrent_requests`` bounds how much of the *KV pool* one key can occupy at once;
+* ``max_concurrent_requests`` bounds how much of the *KV pool* one key can occupy at once. It
+  counts sequences, so an ``n``-way request takes ``n`` of it: every sample holds its own blocks
+  and its own running slot;
 * ``tokens_per_minute`` bounds sustained work with a token bucket, charged at admission for the
-  worst case (prompt plus the full ``max_new_tokens``) so a key cannot reserve cheaply and then
-  generate expensively;
-* ``max_prompt_tokens`` and ``max_new_tokens`` bound a single request.
+  worst case (the prompt plus ``n`` times the full ``max_new_tokens``) so a key cannot reserve
+  cheaply and then generate expensively;
+* ``max_prompt_tokens``, ``max_new_tokens`` and ``max_n`` bound a single request.
 
 ``slo_classes`` is an entitlement, not a hint: a key that is not entitled to the interactive class
 cannot reach the front of the queue by asking for it.
@@ -42,6 +44,8 @@ class KeyPolicy:
     max_prompt_tokens: int = 512
     max_new_tokens: int = 128
     admin: bool = False
+    # Parallel samples per request. Opt-in: one request with n samples costs n sequences.
+    max_n: int = 1
 
     def __post_init__(self) -> None:
         if not self.key_id:
@@ -54,9 +58,23 @@ class KeyPolicy:
             raise ValueError("max_concurrent_requests must be >= 1")
         if self.max_prompt_tokens < 1 or self.max_new_tokens < 1:
             raise ValueError("max_prompt_tokens and max_new_tokens must be >= 1")
+        if self.max_n < 1:
+            raise ValueError("max_n must be >= 1")
 
     def allows(self, slo_class: SloClass) -> bool:
         return slo_class in self.slo_classes
+
+    def ceiling_violation(
+        self, prompt_tokens: int, max_new_tokens: int, n: int
+    ) -> RejectionReason | None:
+        """The per-request ceiling a request breaks, if any."""
+        if prompt_tokens > self.max_prompt_tokens:
+            return RejectionReason.PROMPT_TOO_LONG
+        if max_new_tokens > self.max_new_tokens:
+            return RejectionReason.CONTEXT_TOO_LONG
+        if n > self.max_n:
+            return RejectionReason.TOO_MANY_SAMPLES
+        return None
 
 
 class KeyPolicyStore:
@@ -90,6 +108,7 @@ class KeyPolicyStore:
             max_prompt_tokens=self._default.max_prompt_tokens,
             max_new_tokens=self._default.max_new_tokens,
             admin=False,
+            max_n=self._default.max_n,
         )
 
     def admin_key_ids(self) -> frozenset[str]:
@@ -127,31 +146,32 @@ class EntitlementGuard:
         slo_class: SloClass,
         prompt_tokens: int,
         max_new_tokens: int,
+        n: int = 1,
     ) -> RejectionReason | None:
         """Return the reason a request must be refused, or None when it may be admitted.
 
-        On success the key's in-flight count is incremented and the worst-case token cost is
-        charged; call :meth:`release` when the request finishes or is aborted.
+        On success the key's in-flight count grows by ``n`` (one per sample) and the worst-case
+        token cost -- the prompt, shared by the samples, plus ``n * max_new_tokens`` -- is
+        charged; call :meth:`release` with the same ``n`` when the request finishes or is aborted.
         """
         policy = self.store.get(key_id)
         if policy is None or not policy.allows(slo_class):
             return RejectionReason.CLASS_NOT_ENTITLED
-        if prompt_tokens > policy.max_prompt_tokens:
-            return RejectionReason.PROMPT_TOO_LONG
-        if max_new_tokens > policy.max_new_tokens:
-            return RejectionReason.CONTEXT_TOO_LONG
-        if self.inflight(key_id) >= policy.max_concurrent_requests:
+        ceiling = policy.ceiling_violation(prompt_tokens, max_new_tokens, n)
+        if ceiling is not None:
+            return ceiling
+        if self.inflight(key_id) + n > policy.max_concurrent_requests:
             return RejectionReason.KEY_CONCURRENCY
-        cost = float(prompt_tokens + max_new_tokens)
+        cost = float(prompt_tokens + n * max_new_tokens)
         allowed, _ = self._bucket(policy).try_acquire(self.clock(), cost)
         if not allowed:
             return RejectionReason.KEY_TOKEN_RATE
-        self._inflight[key_id] = self.inflight(key_id) + 1
+        self._inflight[key_id] = self.inflight(key_id) + n
         return None
 
-    def release(self, key_id: str) -> None:
-        """Give back one in-flight slot. Tokens are not refunded: the reservation was the limit."""
-        remaining = self.inflight(key_id) - 1
+    def release(self, key_id: str, n: int = 1) -> None:
+        """Give back a request's ``n`` in-flight slots. Tokens are not refunded here."""
+        remaining = self.inflight(key_id) - n
         if remaining > 0:
             self._inflight[key_id] = remaining
         else:

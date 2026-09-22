@@ -121,7 +121,10 @@ curl -N localhost:8000/v1/completions -H "X-API-Key: <api_key>" \
   -d '{"prompt": "Why reject early?", "max_tokens": 16, "stream": true, "deadline_ms": 2000}'
 ```
 
-A key policy is `<sha256>:<classes>:<tokens/min>:<max concurrent>:<max prompt>:<max new>:<admin>`.
+A key policy is
+`<sha256>:<classes>:<tokens/min>:<max concurrent sequences>:<max prompt>:<max new>:<admin>[:<max n>]`;
+an `n`-way request counts `n` sequences against the concurrency cap and is charged
+`prompt + n * max_new_tokens`, and `n` above the key's limit (default 1) is a 400.
 Every setting is listed in [.env.example](.env.example). `docker compose up --build` runs the
 server and an open-loop load generator against it; the generator reads raw keys from
 `LOADGEN_INTERACTIVE_API_KEY` and `LOADGEN_BATCH_API_KEY` in your shell or `.env` (the compose

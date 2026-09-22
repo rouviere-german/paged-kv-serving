@@ -76,7 +76,11 @@ _log = get_logger("paged_kv_serving.api")
 PrincipalDep = Annotated[Principal, Depends(require_api_key)]
 _SAFE_NAME = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")
 # Reasons that describe the caller's own request rather than the server's current load.
-_CLIENT_ERRORS = {RejectionReason.PROMPT_TOO_LONG, RejectionReason.CONTEXT_TOO_LONG}
+_CLIENT_ERRORS = {
+    RejectionReason.PROMPT_TOO_LONG,
+    RejectionReason.CONTEXT_TOO_LONG,
+    RejectionReason.TOO_MANY_SAMPLES,
+}
 
 
 class CompletionBody(BaseModel):
@@ -143,7 +147,9 @@ def parse_key_policies(entries: Sequence[str]) -> KeyPolicyStore:
     """
     policies = []
     for entry in entries:
-        digest, classes, per_minute, concurrent, prompt, new_tokens, admin = entry.split(":")
+        fields = entry.split(":")
+        digest, classes, per_minute, concurrent, prompt, new_tokens, admin = fields[:7]
+        max_n = int(fields[7]) if len(fields) > 7 else 1
         policies.append(
             KeyPolicy(
                 key_id=digest[:12],
@@ -153,6 +159,7 @@ def parse_key_policies(entries: Sequence[str]) -> KeyPolicyStore:
                 max_prompt_tokens=int(prompt),
                 max_new_tokens=int(new_tokens),
                 admin=admin == "1",
+                max_n=max_n,
             )
         )
     return KeyPolicyStore(policies)

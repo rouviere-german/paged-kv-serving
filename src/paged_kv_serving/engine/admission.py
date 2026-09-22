@@ -67,6 +67,7 @@ class RejectionReason(Enum):
     KEY_CONCURRENCY = "key_concurrency"
     KEY_TOKEN_RATE = "key_token_rate"  # noqa: S105  # nosec B105 - a metric label
     CLASS_NOT_ENTITLED = "class_not_entitled"
+    TOO_MANY_SAMPLES = "too_many_samples"
 
 
 @dataclass(frozen=True, slots=True)

@@ -134,6 +134,10 @@ class Sequence:
     finish_reason: FinishReason | None = None
     # Number of leading blocks taken from the prefix cache on the most recent (re)admission.
     cached_prefix_blocks: int = 0
+    # Running slots held for samples that will fork from this one when its prompt completes
+    # (``n - 1`` on the first sample of an n-way request until it forks, else 0). Admission
+    # counts them, so the forks never push the running set past its cap.
+    fork_slots: int = 0
     # Chained hash of every full block of this sequence, in block-table order. Its length is the
     # number of blocks that have been offered to the prefix cache.
     block_hashes: list[bytes] = field(default_factory=list)

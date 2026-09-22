@@ -61,7 +61,7 @@ def settings_for(tmp_path: Path, **overrides: Any) -> Settings:
         "_env_file": None,
         "api_key_sha256": list(digests.values()),
         "key_policies": [
-            f"{digests[USER]}:interactive|batch:100000:4:64:16:0",
+            f"{digests[USER]}:interactive|batch:100000:4:64:16:0:4",
             f"{digests[BATCH_ONLY]}:batch:100000:4:64:16:0",
             f"{digests[ADMIN]}:interactive|batch:100000:4:64:16:1",
             f"{digests[STINGY]}:interactive|batch:40:4:64:16:0",
@@ -178,6 +178,21 @@ async def test_parallel_samples_and_token_id_prompts_are_supported(
     assert response.status_code == 200
     choices = response.json()["choices"]
     assert [choice["index"] for choice in choices] == [0, 1, 2]
+
+
+async def test_parallel_samples_are_limited_by_the_keys_policy(
+    api: tuple[httpx.AsyncClient, Any],
+) -> None:
+    """Review regression: n was accepted up to 8 whatever the key's policy said."""
+    client, _ = api
+    body = {"prompt_token_ids": [5, 6, 7, 8], "max_tokens": 4, "temperature": 1.0}
+    over = await client.post("/v1/completions", json={**body, "n": 5}, headers=headers(USER))
+    assert over.status_code == 400
+    assert over.json()["error"]["code"] == "too_many_samples"
+    batch_body = {**body, "n": 2, "slo_class": "batch"}
+    none = await client.post("/v1/completions", json=batch_body, headers=headers(BATCH_ONLY))
+    assert none.status_code == 400
+    assert none.json()["error"]["code"] == "too_many_samples"
 
 
 async def test_streaming_emits_token_events_then_a_summary_and_done(
@@ -298,6 +313,7 @@ def test_every_rejection_reason_maps_to_a_distinct_client_signal() -> None:
     statuses = {reason: _reject(reason, "3").status_code for reason in RejectionReason}
     assert statuses[RejectionReason.PROMPT_TOO_LONG] == 400
     assert statuses[RejectionReason.CONTEXT_TOO_LONG] == 400
+    assert statuses[RejectionReason.TOO_MANY_SAMPLES] == 400
     assert statuses[RejectionReason.CLASS_NOT_ENTITLED] == 403
     assert statuses[RejectionReason.KEY_CONCURRENCY] == 429
     assert statuses[RejectionReason.KEY_TOKEN_RATE] == 429

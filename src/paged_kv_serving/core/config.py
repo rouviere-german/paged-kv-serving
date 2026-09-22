@@ -21,9 +21,10 @@ __all__ = ["Settings", "get_settings"]
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _ORIGIN = re.compile(r"^https?://[A-Za-z0-9.-]+(:\d{1,5})?$")
 # <sha256>:<classes|separated>:<tokens_per_minute>:<max_concurrent>:<max_prompt>:<max_new>:<admin>
+# optionally followed by :<max parallel samples, 1-8> (default 1)
 _KEY_POLICY = re.compile(
     r"^[0-9a-f]{64}:(?:interactive|batch)(?:\|(?:interactive|batch))*:\d{1,9}:\d{1,4}:\d{1,6}"
-    r":\d{1,6}:[01]$"
+    r":\d{1,6}:[01](?::[1-8])?$"
 )
 
 
@@ -101,8 +102,8 @@ class Settings(BaseSettings):
 
     # --- per-key entitlements ---
     # Comma-separated entries, each
-    # <api key sha256>:<interactive|batch, | separated>:<tokens/min>:<max concurrent>
-    # :<max prompt tokens>:<max new tokens>:<1 for admin, else 0>
+    # <api key sha256>:<interactive|batch, | separated>:<tokens/min>:<max concurrent sequences>
+    # :<max prompt tokens>:<max new tokens>:<1 for admin, else 0>[:<max parallel samples n>]
     key_policies: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     # --- storage ---
@@ -125,7 +126,7 @@ class Settings(BaseSettings):
             if not _KEY_POLICY.fullmatch(entry):
                 raise ValueError(
                     "key_policies entries must be "
-                    "<sha256>:<classes>:<tokens/min>:<concurrent>:<prompt>:<new>:<admin>"
+                    "<sha256>:<classes>:<tokens/min>:<concurrent>:<prompt>:<new>:<admin>[:<n>]"
                 )
         return value
 

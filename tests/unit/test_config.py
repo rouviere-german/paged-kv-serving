@@ -37,6 +37,11 @@ def test_environment_variables_are_parsed(monkeypatch: pytest.MonkeyPatch) -> No
     assert settings.key_policies == [policy]
 
 
+def test_a_key_policy_may_end_with_a_parallel_sample_limit() -> None:
+    entry = f"{'c' * 64}:batch:6000:8:512:128:0:4"
+    assert Settings(_env_file=None, key_policies=[entry]).key_policies == [entry]
+
+
 @pytest.mark.parametrize(
     "entry",
     [
@@ -44,6 +49,8 @@ def test_environment_variables_are_parsed(monkeypatch: pytest.MonkeyPatch) -> No
         f"{'c' * 64}:platinum:1:1:1:1:0",
         f"{'c' * 64}:interactive:1:1:1:1:2",
         f"{'c' * 64}:interactive:-1:1:1:1:0",
+        f"{'c' * 64}:interactive:1:1:1:1:0:0",
+        f"{'c' * 64}:interactive:1:1:1:1:0:99",
     ],
 )
 def test_malformed_key_policies_are_rejected(entry: str) -> None:

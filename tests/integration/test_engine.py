@@ -354,3 +354,43 @@ def test_the_context_limit_is_checked_against_the_model(tiny_model: LanguageMode
     )
     with pytest.raises(ValueError, match="exceeds the model"):
         Engine(tiny_model, too_big)
+
+
+def test_parallel_samples_never_push_the_running_set_past_its_cap(
+    tiny_model: LanguageModel, engine_config: EngineConfig
+) -> None:
+    """Review regression: forks were added to the running set whatever its size.
+
+    A request is admitted only when every one of its samples has a running slot, so the decode
+    budget admission control reserves for running sequences is never exceeded either.
+    """
+    config = dataclasses.replace(engine_config, max_running_seqs=4)
+    engine = Engine(tiny_model, config)
+    batch = prompts(4, seed=9, low=10, high=20)
+    requests = [
+        request_for(0, batch[0], max_new_tokens=6, n=3, temperature=1.0),
+        request_for(1, batch[1], max_new_tokens=6, n=3, temperature=1.0),
+        request_for(2, batch[2], max_new_tokens=6, n=1),
+        request_for(3, batch[3], max_new_tokens=6, n=4, temperature=1.0),
+    ]
+    for request in requests:
+        assert engine.submit(request).admitted
+    peak = 0
+    outputs: list[RequestOutput] = []
+    while engine.has_work:
+        step = engine.step()
+        peak = max(peak, engine.scheduler.num_running)
+        outputs.extend(step.finished)
+    assert peak <= config.max_running_seqs
+    assert sorted(len(output.samples) for output in outputs) == [1, 3, 3, 4]
+    engine.check_invariants()
+
+
+def test_more_samples_than_running_slots_is_refused_up_front(
+    tiny_model: LanguageModel, engine_config: EngineConfig
+) -> None:
+    engine = Engine(tiny_model, dataclasses.replace(engine_config, max_running_seqs=2))
+    decision = engine.submit(request_for(0, [1, 2, 3], n=8, temperature=1.0))
+    assert decision.reason is RejectionReason.TOO_MANY_SAMPLES
+    assert engine.active_requests == 0
+    assert engine.blocks.num_free_blocks == engine_config.num_blocks

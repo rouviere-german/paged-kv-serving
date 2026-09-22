@@ -145,6 +145,11 @@ class Scheduler:
     def has_work(self) -> bool:
         return bool(self._waiting or self._running)
 
+    @property
+    def slots_in_use(self) -> int:
+        """Running slots taken: running sequences plus the forks they will create."""
+        return sum(1 + sequence.fork_slots for sequence in self._running)
+
     def add(self, sequence: Sequence) -> None:
         """Queue a fresh sequence for admission."""
         sequence.status = SequenceStatus.WAITING
@@ -372,7 +377,7 @@ class Scheduler:
         allowance: _LowerClassAllowance,
     ) -> int:
         """Admit one waiting sequence with its first chunk. Returns the tokens spent (0: not)."""
-        if len(self._running) >= self.config.max_running_seqs:
+        if self.slots_in_use + 1 + sequence.fork_slots > self.config.max_running_seqs:
             return 0
         reuse = self.cache.attach_prefix(sequence, record=False)
         # The watermark keeps room for the decode steps of running sequences. With nothing

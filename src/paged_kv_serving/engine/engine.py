@@ -303,6 +303,21 @@ class Engine:
         self.metrics.rejections_total.labels(reason.value).inc()
         return AdmissionDecision(False, reason, retry_after_seconds=retry_after)
 
+    def _limit_violation(self, request: Request) -> RejectionReason | None:
+        """The engine-wide ceiling a request breaks, if any."""
+        sampling = request.sampling
+        if request.prompt_len > self.config.max_prompt_tokens:
+            return RejectionReason.PROMPT_TOO_LONG
+        if (
+            sampling.max_new_tokens > self.config.max_new_tokens
+            or request.prompt_len + sampling.max_new_tokens > self.config.max_context_tokens
+        ):
+            return RejectionReason.CONTEXT_TOO_LONG
+        if request.n > self.config.max_running_seqs:
+            # Every sample needs a running slot at the same time; this request could never start.
+            return RejectionReason.TOO_MANY_SAMPLES
+        return None
+
     def submit(self, request: Request) -> AdmissionDecision:
         """Validate, meter and admit a request, or refuse it with a reason and a Retry-After.
 
@@ -312,18 +327,16 @@ class Engine:
         if request.request_id in self._requests:
             raise ValueError(f"request {request.request_id} is already in flight")
         sampling = request.sampling
-        if request.prompt_len > self.config.max_prompt_tokens:
-            return self._reject(RejectionReason.PROMPT_TOO_LONG)
-        if sampling.max_new_tokens > self.config.max_new_tokens:
-            return self._reject(RejectionReason.CONTEXT_TOO_LONG)
-        if request.prompt_len + sampling.max_new_tokens > self.config.max_context_tokens:
-            return self._reject(RejectionReason.CONTEXT_TOO_LONG)
+        violation = self._limit_violation(request)
+        if violation is not None:
+            return self._reject(violation)
         if self.entitlements is not None:
             reason = self.entitlements.check(
                 request.key_id,
                 slo_class=request.slo_class,
                 prompt_tokens=request.prompt_len,
                 max_new_tokens=sampling.max_new_tokens,
+                n=request.n,
             )
             if reason is not None:
                 return self._reject(reason, retry_after=60.0)
@@ -344,13 +357,14 @@ class Engine:
         )
         if not decision.admitted:
             if self.entitlements is not None:
-                self.entitlements.release(request.key_id)
+                self.entitlements.release(request.key_id, request.n)
             reason = decision.reason or RejectionReason.DEADLINE_INFEASIBLE
             self.metrics.rejections_total.labels(reason.value).inc()
             return decision
 
         state = _RequestState(request=request)
         primary = Sequence.from_request(request, 0)
+        primary.fork_slots = request.n - 1
         state.sequences[0] = primary
         for index in range(1, request.n):
             child = Sequence.from_request(request, index)
@@ -383,7 +397,7 @@ class Engine:
             removed += 1
         state.pending_forks.clear()
         if self.entitlements is not None:
-            self.entitlements.release(state.request.key_id)
+            self.entitlements.release(state.request.key_id, state.request.n)
         self.aborted_requests += 1
         self.metrics.aborted_requests_total.inc()
         return removed
@@ -456,6 +470,8 @@ class Engine:
             self.scheduler.add_running(child)
             self._emit(child, logits, now, events)
         state.pending_forks.clear()
+        # The slots held for the forks are now taken by the forks themselves.
+        sequence.fork_slots = 0
 
     def _emit(
         self, sequence: Sequence, logits: FloatArray, now: float, events: list[TokenEvent]
@@ -513,7 +529,7 @@ class Engine:
         request = state.request
         del self._requests[request.request_id]
         if self.entitlements is not None:
-            self.entitlements.release(request.key_id)
+            self.entitlements.release(request.key_id, request.n)
         output = RequestOutput(
             request_id=request.request_id,
             key_id=request.key_id,

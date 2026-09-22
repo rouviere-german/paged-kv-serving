@@ -147,6 +147,25 @@ def max_tokens_flood(count: int = 60) -> list[Request]:
     ]
 
 
+def parallel_samples_flood(count: int = 60, n: int = 8) -> list[Request]:
+    """Every request asks for eight samples of the longest answer the key may have."""
+    rng = np.random.default_rng(4)
+    return [
+        Request(
+            request_id=f"abuse-n-{index:03d}",
+            prompt_token_ids=tuple(int(v) for v in rng.integers(1, 60, 16)),
+            sampling=SamplingParams(
+                max_new_tokens=CONFIG.max_new_tokens, temperature=1.0, seed=index
+            ),
+            n=n,
+            slo_class=SloClass.BATCH,
+            key_id=ABUSER,
+            arrival_time=index * 0.005,
+        )
+        for index in range(count)
+    ]
+
+
 def drain(engine: Engine, clock: ManualClock, requests: list[Request]) -> list[RequestOutput]:
     return drain_on_clock(engine, clock, requests, max_iterations=200_000)
 
@@ -304,3 +323,64 @@ def test_the_engine_without_entitlements_still_enforces_its_own_limits(
         )
     )
     assert decision.reason is RejectionReason.PROMPT_TOO_LONG
+
+
+def test_parallel_samples_do_not_widen_an_abusive_keys_share(
+    tiny_model_module: LanguageModel, baseline: tuple[float, int]
+) -> None:
+    """Review regression: ``n`` multiplied what a key got without multiplying what it paid.
+
+    The abusive key here may ask for eight samples; its concurrency cap and token budget are
+    charged per sample. The victim must still complete every request inside the same p99 bound
+    as under the other attacks, the running set must stay within its cap, and the abuser must get
+    no more tokens than its budget pays for.
+    """
+    _, baseline_completed = baseline
+    abuser = KeyPolicy(
+        key_id=ABUSER,
+        slo_classes=frozenset({SloClass.BATCH}),
+        tokens_per_minute=2_000,
+        max_concurrent_requests=8,
+        max_prompt_tokens=CONFIG.max_prompt_tokens,
+        max_new_tokens=CONFIG.max_new_tokens,
+        max_n=8,
+    )
+    victim = policies().get(VICTIM)
+    assert victim is not None
+    engine, clock = simulated_engine(
+        tiny_model_module,
+        CONFIG,
+        seconds_per_token=SECONDS_PER_TOKEN,
+        entitlements=EntitlementGuard(KeyPolicyStore([victim, abuser])),
+    )
+    pending = sorted(
+        [*victim_requests(), *parallel_samples_flood()], key=lambda item: item.arrival_time
+    )
+    peak_running = 0
+    outputs: list[RequestOutput] = []
+    index = 0
+    for _ in range(200_000):
+        while index < len(pending) and pending[index].arrival_time <= clock.now:
+            engine.submit(pending[index])
+            index += 1
+        if engine.has_work:
+            outputs.extend(engine.step().finished)
+            peak_running = max(peak_running, engine.scheduler.num_running)
+            continue
+        if index >= len(pending):
+            break
+        clock.now = pending[index].arrival_time
+    engine.check_invariants()
+
+    served = [output for output in outputs if output.key_id == VICTIM]
+    assert len(served) == baseline_completed, "the victim's requests were refused"
+    assert all(output.met_deadline for output in served)
+    assert percentile(victim_latencies(outputs), 99) <= VICTIM_DEADLINE / 4
+    assert peak_running <= CONFIG.max_running_seqs
+    abusive = [output for output in outputs if output.key_id == ABUSER]
+    assert abusive, "the abuser was not served at all"
+    charged = sum(o.prompt_tokens + len(o.samples) * CONFIG.max_new_tokens for o in abusive)
+    # The bucket starts with one minute of allowance and refills at 2,000 a minute.
+    allowance = abuser.tokens_per_minute * (1.0 + clock.now / 60.0)
+    assert charged <= allowance
+    assert sum(output.output_tokens for output in abusive) <= allowance

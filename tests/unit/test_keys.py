@@ -191,3 +191,62 @@ def test_slo_class_parsing() -> None:
     assert SloClass.parse("batch").rank == 1
     with pytest.raises(ValueError, match="unknown SLO class"):
         SloClass.parse("urgent")
+
+
+KEY = "abc123def456"
+
+
+def test_parallel_samples_are_charged_per_sample() -> None:
+    """Review regression: an n-way request used to be charged for one sample's output.
+
+    With 40 tokens a minute, 8 prompt tokens plus 16 new tokens looked affordable, and n=8 then
+    generated 128 output tokens against that one charge.
+    """
+    entitlements = guard(policy(tokens_per_minute=40, max_concurrent_requests=8, max_n=8))
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=8, max_new_tokens=16, n=8)
+        is RejectionReason.KEY_TOKEN_RATE
+    )
+    # 8 prompt tokens + 2 samples x 16 new tokens = 40: exactly one minute of allowance.
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=8, max_new_tokens=16, n=2)
+        is None
+    )
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1)
+        is RejectionReason.KEY_TOKEN_RATE
+    )
+
+
+def test_every_sample_counts_against_the_concurrency_cap() -> None:
+    entitlements = guard(policy(max_concurrent_requests=4, max_n=4))
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1, n=3)
+        is None
+    )
+    assert entitlements.inflight(KEY) == 3
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1, n=2)
+        is RejectionReason.KEY_CONCURRENCY
+    )
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1) is None
+    )
+    entitlements.release(KEY, n=3)
+    assert entitlements.inflight(KEY) == 1
+
+
+def test_a_policy_caps_the_number_of_parallel_samples() -> None:
+    assert policy().max_n == 1, "parallel sampling is opt-in per key"
+    entitlements = guard(policy(max_n=2, max_concurrent_requests=8))
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1, n=3)
+        is RejectionReason.TOO_MANY_SAMPLES
+    )
+    assert entitlements.inflight(KEY) == 0
+    assert (
+        entitlements.check(KEY, slo_class=SloClass.BATCH, prompt_tokens=1, max_new_tokens=1, n=2)
+        is None
+    )
+    with pytest.raises(ValueError, match="max_n"):
+        policy(max_n=0)
