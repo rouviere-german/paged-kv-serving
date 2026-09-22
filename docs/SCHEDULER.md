@@ -60,11 +60,13 @@ flowchart TD
     r -- pool exhausted --> v[preempt lowest-priority<br/>unscheduled sequence]
     v --> d
     r -- ok --> d
-    d -- none left / budget 0 --> p[continue partial prefills<br/>chunk = min budget, remaining, memory, allowance]
-    p --> a{preempted this iteration?}
-    a -- no --> w[admit waiting sequences<br/>class, then deadline, then arrival<br/>prefix-cache lookup once per admission]
-    a -- yes --> x
-    w --> x([ExecutionBatch])
+    d -- none left / budget 0 --> o[one pass over running prefills and waiters<br/>class, then deadline, then arrival]
+    o --> k{next in order}
+    k -- running prefill --> c[next chunk = min budget, remaining, memory, allowance<br/>no block at all: preempt the lowest-priority<br/>running prefill behind it]
+    k -- waiter, admission open --> w[admit with its first chunk if a running slot<br/>forks included, memory and allowance remain;<br/>otherwise admission closes for this iteration]
+    c --> k
+    w --> k
+    k -- budget 0 / end --> x([ExecutionBatch])
     x --> run[runner.execute: write K/V into slots, paged attention, logits for slices that end]
     run --> s[sample with the sequence's own RNG<br/>fork pending samples on the first token]
     s --> pub[publish newly full blocks to the prefix cache]
@@ -76,25 +78,48 @@ flowchart TD
    lowest-priority running sequence *not yet scheduled in this iteration* is preempted -- a decoder
    still waiting or a sequence part-way through prefill -- and the reservation is retried. A
    sequence that is the last one standing preempts itself, which releases its blocks for others.
-2. **Continue prefills.** Running sequences whose prompt is incomplete take the remaining budget in
-   chunks (Sarathi-Serve style chunked prefill, Agrawal et al., OSDI 2024), limited by free plus
-   evictable blocks.
-3. **Admit.** Waiting sequences join in priority order while budget, running slots and blocks
-   (above a small watermark) remain. Admission stops at the first sequence that cannot get even
-   one token, so a lower-priority request never jumps a higher-priority one that is waiting for
-   memory. Nothing is admitted in an iteration that preempted.
+2. **Prefill, in one priority order.** Running sequences whose prompt is incomplete and waiting
+   sequences share one pass ordered by class, deadline and arrival -- the order admission control
+   assumes. A running prompt takes its next chunk (Sarathi-Serve style chunked prefill, Agrawal et
+   al., OSDI 2024), limited by the budget, free plus evictable blocks and the allowance; if it
+   cannot get a single block it preempts the lowest-priority running prefill behind it. A waiter is
+   admitted with its first chunk while a running slot (counting the slots its future forks will
+   need), blocks above a small watermark and allowance remain. Admission closes at the first waiter
+   that cannot be admitted, so a lower-priority request never jumps a higher-priority one waiting
+   for memory, and for the rest of any iteration that preempted; running prefills behind it still
+   continue, because they already hold blocks and finishing them is what frees memory.
 
-While any higher-class sequence is running or waiting, all lower-class prefill in phases 2 and 3
-shares an allowance of `lower_class_prefill_share * max_batched_tokens` tokens (ADR 0005). Decode
-is never capped.
+   Continuing every running prefill before admitting anybody (the original order) let a prompt with
+   a loose deadline that happened to start first take the whole budget ahead of a tight one that
+   arrived an iteration later -- admitted on a promise the scheduler then broke (review
+   counterexample, now `tests/integration/test_deadlines.py::test_an_earlier_deadline_arriving_mid_prefill_is_served_first`).
+
+While any higher-class sequence is running or waiting, all lower-class prefill in phase 2 shares an
+allowance of `lower_class_prefill_share * max_batched_tokens` tokens (ADR 0005). Decode is never
+capped.
+
+**Liveness.** No iteration is empty while work is queued. A decoder or a running prefill that
+cannot get a block preempts somebody behind it; a waiter that is not admitted releases the cached
+blocks it matched, so it pins nothing; and the watermark is ignored while nothing is running.
+`EngineConfig` guarantees that one maximum-length sequence fits the pool, so the highest-priority
+sequence can always run. Two long prompts that each held part of the pool used to leave every
+later iteration empty until their requests timed out; the service loop now also backs off (and
+logs `engine_stalled`) instead of spinning with the lock held if an empty iteration ever happens.
+
+**Parallel samples.** The first sample of an `n`-way request is admitted only when `n` running
+slots are free, and holds `n - 1` of them until it forks, so the running set -- and with it the
+decode budget admission control reserves -- never exceeds `max_running_seqs`. A request with `n`
+above that cap is refused up front (400 `too_many_samples`).
 
 ## Admission control (before step 1)
 
-`Engine.submit` rejects, before a single block is allocated: prompts or `max_new_tokens` over the
-engine limits (400), keys not entitled to the requested SLO class (403), keys over their
-concurrency or tokens-per-minute limits (429), a full queue (503) and requests whose deadline the
+`Engine.submit` rejects, before a single block is allocated: prompts, `max_new_tokens` or `n` over
+the engine limits (400), keys not entitled to the requested SLO class (403), keys over their
+concurrency or tokens-per-minute limits (429; an `n`-way request counts `n` sequences and is
+charged `prompt + n * max_new_tokens`), a full queue (503) and requests whose deadline the
 iteration-counting test says cannot be met (503 with a `Retry-After` computed from the backlog).
-The test and its pessimism are described in ADR 0004.
+A request the server refuses for load gets its token charge back. The test and its pessimism are
+described in ADR 0004.
 
 ## Cancellation, timeouts and drain
 
@@ -104,7 +129,12 @@ The test and its pessimism are described in ADR 0004.
   a cancelled scope is cancelled again, so awaiting the abort inline would never take the engine
   lock and the blocks would stay pinned.
 - `APP_REQUEST_TIMEOUT_SECONDS` bounds the wall time of every request, streaming or not; a
-  request that runs out is aborted the same way (504, or an SSE `error` event).
+  request that runs out is aborted the same way (504, or an SSE `error` event). A request with
+  `deadline_ms` is aborted at its deadline instead (`deadline_exceeded`), and `deadline_ms` may not
+  exceed the timeout.
+- A non-streaming request races its collector against a disconnect watcher, so a client that
+  sends `stream: false` and hangs up is aborted too. Both paths close the engine stream explicitly;
+  leaving it to garbage collection delayed the abort.
 - On shutdown the lifespan calls `EngineService.drain`: stop admitting (new requests get 503
   `draining`), wait for in-flight requests up to `APP_DRAIN_TIMEOUT_SECONDS`, then stop the loop.
 
@@ -117,4 +147,7 @@ The test and its pessimism are described in ADR 0004.
 | A block registered in the prefix cache never changes content | same stateful machine |
 | Paged, chunked, batched, shared, preempted execution gives the logits of a dense recompute | `tests/property/test_engine_equivalence.py`, `tests/property/test_equivalence.py` |
 | A preempted request produces the same tokens | `tests/integration/test_engine.py` |
-| With an accurate latency model no admitted request misses its deadline | `tests/integration/test_deadlines.py`, `bench/bench_serving.py` |
+| No iteration is empty while work is queued | `tests/property/test_engine_equivalence.py` (asserted after every step), `tests/unit/test_scheduler.py` |
+| The running set never exceeds `max_running_seqs`, forks included | `tests/integration/test_engine.py`, `tests/integration/test_adversarial.py` |
+| Sample `i` of an `n`-way request depends only on `(seed, i)`, with or without preemption | `tests/integration/test_engine.py` |
+| With an exact latency model and a fake clock, no admitted request misses its deadline -- observed on the benchmark workloads and in a hypothesis search with prompts several times the budget, not proven; the bound does not model preemption or KV pressure (ADR 0004) | `tests/integration/test_deadlines.py`, `bench/bench_serving.py` |

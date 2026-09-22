@@ -30,7 +30,11 @@ work ahead divided by a token rate -- is wrong for an LLM engine in two ways:
         iterations(D) * L(max_batched_tokens) * safety_factor <= D - now
 
 - "Ahead of D" follows the scheduler's order: all work of higher classes plus same-class work due
-  no later than D.
+  no later than D. The scheduler has to keep that promise: an earlier version continued every
+  running prefill before admitting anybody, so a loose-deadline prompt already mid-prefill took the
+  budget ahead of a tight request that arrived one iteration later, which was admitted (predicted
+  0.096 s) and missed (finished at 0.169 s against 0.132 s). Running prefills and waiters now share
+  one priority pass, and the counterexample is a test.
 - The guaranteed prefill rate is the budget left after decode for the top class, and the
   lower-class allowance for lower classes (ADR 0005), so a later interactive arrival cannot slow
   admitted batch work below what admission assumed.
@@ -41,18 +45,22 @@ work ahead divided by a token rate -- is wrong for an LLM engine in two ways:
 
 ## Consequences
 
-- With an exact latency model and a fake clock, no admitted request misses its deadline: 0 misses
-  among the 877 requests admitted out of 1,200 offered at 0.5x-4x load (`bench/bench_serving.py`,
-  admission table; the simulation is deterministic), and
-  `tests/integration/test_deadlines.py::test_no_admitted_request_misses_its_deadline_under_heavy_overload`.
+- With an exact latency model and a fake clock, no admitted request missed its deadline: 0 misses
+  among the 882 requests admitted out of 1,200 offered at 0.5x-4x load (`bench/bench_serving.py`,
+  admission table; the simulation is deterministic),
+  `tests/integration/test_deadlines.py::test_no_admitted_request_misses_its_deadline_under_heavy_overload`,
+  and a hypothesis search with prompts several times the token budget
+  (`tests/integration/test_deadlines.py::test_admitted_requests_meet_their_deadlines_when_prompts_outlast_the_budget`).
+  That is evidence on these workloads, not a proof.
 - The price is pessimism. Costing a two-token decode iteration like a full 128-token one refuses
-  requests that would have made it: in the same benchmark, accepting everything completes 197
-  on time at 2x load against 187 with admission, and at 0.5x load admission refuses 13 requests
+  requests that would have made it: in the same benchmark, accepting everything completes 196
+  on time at 2x load against 186 with admission, and at 0.5x load admission refuses 13 requests
   whose deadlines were tight but, as it turned out, feasible. What admission buys is the other
-  side: at 4x load accept-all lets 187 of 300 requests miss their deadline (each one holding KV
-  blocks until it does), while admission refuses 174 of them at arrival and misses none.
+  side: at 4x load accept-all lets 188 of 300 requests miss their deadline (each one holding KV
+  blocks until it does), while admission refuses 168 of them at arrival and misses none.
 - The bound ignores two scheduler limits: KV memory (a preemption can delay a request) and the
-  running-set cap. Both are covered only by the safety factor; the simulated tests size the pool
-  so that neither binds.
+  running-set cap (which counts the slots a request's parallel samples will need). Both are
+  covered only by the safety factor; the simulated tests size the pool so that neither binds, so
+  the zero-miss observation does not extend to memory pressure that forces preemption.
 - A tighter bound would cost decode-only iterations at `L(running sequences)`. It is not used,
   because lower-priority prefill can join any iteration and make it a full one.

@@ -29,17 +29,21 @@ upstream).
 - Threats, controls and the tests that prove them: [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md).
 - Every security claim is linked to evidence in [CLAIMS.md](CLAIMS.md).
 - API keys are stored as SHA-256 digests; each key has a policy (SLO classes, tokens per minute,
-  concurrent requests, prompt and output ceilings, admin scope). A key without a policy cannot
-  call the engine.
+  concurrent sequences, prompt and output ceilings, parallel samples `n`, admin scope). A key
+  without a policy cannot call the engine, including when no policies are configured at all. An
+  `n`-way request counts `n` sequences and is charged `prompt + n * max_new_tokens`.
 - Weights are loaded only from safetensors after every file's SHA-256 has been checked against the
-  checkpoint manifest; the manifest digest can be pinned, and the admin weight swap requires it.
+  checkpoint manifest, which must list the weights and the tokenizer by plain file name; the
+  manifest digest can be pinned, and the admin weight swap requires it.
   Nothing in `src/` uses pickle or a pickle-compatible format.
 - Prompts and completions are never logged or put in trace spans: lengths and a SHA-256 of the
   prompt only.
 - Prefix-cache reuse is scoped to the calling key by default, closing the cross-tenant
   time-to-first-token side channel (docs/adr/0003-per-key-prefix-cache-scope.md).
-- Admin operations (prefix-cache flush, weight swap) need the admin scope and are appended to a
-  hash-chained audit log; `paged-kv-serving audit verify` checks it.
+- Admin operations (prefix-cache flush, weight swap) need the admin scope. The intent is appended
+  to a hash-chained audit log (HMAC-SHA256 with `APP_AUDIT_HMAC_KEY`) before anything changes, and
+  the action is refused if it cannot be recorded; refused attempts are recorded too. Every append
+  logs the new chain head, which `paged-kv-serving audit verify --expect-head` checks against.
 - CI runs ruff, mypy --strict, pytest with a coverage floor, bandit, semgrep (registry packs plus
   `.semgrep/rules.yml`), pip-audit, gitleaks, hadolint, a trivy image scan and a syft CycloneDX
   SBOM.

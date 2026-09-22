@@ -21,8 +21,10 @@ language quality.
 - **Owner:** Rouviere German. **Date:** 2026-09-22. **License:** MIT.
 - **Artifact format:** `weights.safetensors` + `tokenizer.json` + `manifest.json`. The manifest
   records the architecture, parameter count, tokenizer vocabulary size and the SHA-256 and byte
-  size of every other file; `load_checkpoint` verifies all of them before parsing anything, and
-  the manifest's own digest can be pinned (`APP_CHECKPOINT_MANIFEST_SHA256`). Never pickle.
+  size of every other file; `load_checkpoint` refuses a manifest that does not list both the
+  weights and the tokenizer (or names a file outside the checkpoint directory), verifies every
+  listed digest before parsing anything, and the manifest's own digest can be pinned
+  (`APP_CHECKPOINT_MANIFEST_SHA256`). Never pickle.
 
 ## Intended use
 
@@ -41,7 +43,7 @@ from the paged engine and from `LanguageModel.reference_forward` (dense attentio
 | Check | Result | Source |
 |---|---:|---|
 | One prompt, arbitrary chunk splits and a reversed block table (4 prompts) | max abs gap 2.44e-06 | `uv run python bench/bench_baseline.py` |
-| Whole workload through the scheduler: 16 requests, a 20-block pool (8 preemptions), prefix-cache hits (35 blocks), greedy and sampled, `n = 2` forks; 264 logits rows | max abs gap 3.19e-06 | same |
+| Whole workload through the scheduler: 16 requests, a 20-block pool (7 preemptions), prefix-cache hits (30 blocks), greedy and sampled, `n = 2` forks; 264 logits rows | max abs gap 3.25e-06 | same |
 | Hypothesis-generated engine configurations and workloads | every row below 1e-4 | `tests/property/test_engine_equivalence.py` |
 
 The tolerance used everywhere is 1e-4; the observed gaps are float32 rounding from a different
@@ -49,12 +51,15 @@ reduction order (online softmax over blocks against one softmax over the whole r
 
 ## Request data contract
 
-Request telemetry (one row per finished request: ids, key id, prompt SHA-256, class, finish reason,
-token counts, TTFT, latency, arrival time) is validated by the strict pandera schema
-`RequestRecordSchema` (`ml/contracts.py`). Unknown columns fail validation, so a column holding
-prompt or completion text cannot be added by accident; failures are summarised as column, check
-and count without the offending values. Cross-column checks: cached prompt tokens never exceed the
-prompt, TTFT never exceeds latency.
+The server exports request telemetry (one row per finished request: ids, key id, prompt SHA-256,
+class, finish reason, token counts, preemptions, TTFT, latency, wall-clock arrival time in UTC) to
+`<APP_DATA_DIR>/telemetry/requests.jsonl` (`engine/telemetry.py`, on by default,
+`APP_TELEMETRY_ENABLED`). Every batch is validated by the strict pandera schema
+`RequestRecordSchema` (`ml/contracts.py`) before it is written. Unknown columns fail validation,
+so a column holding prompt or completion text cannot be added by accident; a failing batch is
+dropped whole and logged as column, check and count without the offending values. Cross-column
+checks: cached prompt tokens never exceed the prompt, TTFT never exceeds latency. The file is
+rotated once at `APP_TELEMETRY_MAX_BYTES`. Aborted and refused requests produce no row.
 
 ## Monitoring
 
