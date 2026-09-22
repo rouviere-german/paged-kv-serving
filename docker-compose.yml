@@ -1,0 +1,67 @@
+# Local stack: the server and an open-loop load generator, both from the locally built image.
+# Nothing is pulled at runtime besides the pinned base images.
+#
+# Keys: generate two with `uv run paged-kv-serving generate-api-key` and set, in .env or the shell:
+#   APP_API_KEY_SHA256=<interactive digest>,<batch digest>
+#   APP_KEY_POLICIES=<interactive digest>:interactive|batch:60000:8:512:128:0,<batch digest>:batch:20000:4:512:128:0
+#   LOADGEN_INTERACTIVE_API_KEY=<interactive raw key>
+#   LOADGEN_BATCH_API_KEY=<batch raw key>
+# The raw keys go only to the load generator; the server only ever sees digests.
+services:
+  server:
+    build:
+      context: .
+    image: paged-kv-serving:local
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      APP_ENVIRONMENT: prod
+      APP_LOG_LEVEL: INFO
+      APP_API_KEY_SHA256: ${APP_API_KEY_SHA256:-}
+      APP_KEY_POLICIES: ${APP_KEY_POLICIES:-}
+      # Digest of the checkpoint built into the image (deterministic: seeded weights, fixed
+      # timestamp). A checkpoint whose manifest does not match is refused at start-up.
+      APP_CHECKPOINT_MANIFEST_SHA256: ${APP_CHECKPOINT_MANIFEST_SHA256:-cf6912e1dfedf43fa7caebef4b46f4c06f2fe57f13c44c514097dfd50a1edb2f}
+      # The load generator is a single client address; keep the per-address limiter out of its way.
+      APP_RATE_LIMIT_PER_SECOND: "200"
+      APP_RATE_LIMIT_BURST: "400"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 2.0
+    # SIGTERM drains: new requests get 503, in-flight ones finish (APP_DRAIN_TIMEOUT_SECONDS).
+    stop_grace_period: 40s
+    restart: unless-stopped
+
+  loadgen:
+    image: paged-kv-serving:local
+    depends_on:
+      server:
+        condition: service_healthy
+    command:
+      - loadgen
+      - --url=http://server:8000
+      - --rate=10
+      - --count=120
+      - --burst-rate=60
+      - --burst-start=3
+      - --burst-seconds=2
+    environment:
+      LOADGEN_INTERACTIVE_API_KEY: ${LOADGEN_INTERACTIVE_API_KEY:-}
+      LOADGEN_BATCH_API_KEY: ${LOADGEN_BATCH_API_KEY:-}
+    read_only: true
+    tmpfs:
+      - /tmp:size=8m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    restart: "no"
