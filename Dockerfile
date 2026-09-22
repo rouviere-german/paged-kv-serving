@@ -23,8 +23,12 @@ COPY src ./src
 RUN uv sync --frozen --no-dev --no-editable
 # A deterministic random-init checkpoint (seeded weights, fixed timestamp), built once at image
 # build time so the container needs no download. The manifest digest it prints is the value
-# docker-compose.yml pins through APP_CHECKPOINT_MANIFEST_SHA256.
-RUN /opt/venv/bin/python -m paged_kv_serving build-checkpoint --out /opt/checkpoint --seed 0
+# docker-compose.yml pins through APP_CHECKPOINT_MANIFEST_SHA256. The atomic writer creates files
+# 0600 (mkstemp), and the runtime user is not root: the files become world-readable but stay
+# root-owned and read-only, so the service can load its checkpoint and cannot rewrite it.
+RUN /opt/venv/bin/python -m paged_kv_serving build-checkpoint --out /opt/checkpoint --seed 0 \
+    && chmod 0555 /opt/checkpoint \
+    && chmod 0444 /opt/checkpoint/*
 
 FROM ${PYTHON_IMAGE} AS runtime
 LABEL org.opencontainers.image.title="paged-kv-serving" \
