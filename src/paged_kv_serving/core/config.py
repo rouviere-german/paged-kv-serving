@@ -109,6 +109,10 @@ class Settings(BaseSettings):
 
     # --- storage ---
     data_dir: Path = Path("var")
+    # Request telemetry: one contract-validated JSONL row per finished request (lengths, timings,
+    # a prompt digest; never text) in <data_dir>/telemetry/requests.jsonl, rotated once at the cap.
+    telemetry_enabled: bool = True
+    telemetry_max_bytes: int = Field(default=8 * 1024 * 1024, ge=4_096, le=1_073_741_824)
     # HMAC key for the admin audit chain. Unset: plain SHA-256, which anybody who can write the
     # file can recompute. Set: rewriting the chain needs this secret as well.
     audit_hmac_key: SecretStr | None = Field(default=None, min_length=32)

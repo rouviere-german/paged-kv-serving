@@ -365,6 +365,40 @@ async def test_prompts_and_outputs_are_never_logged(checkpoint: Checkpoint, tmp_
         assert completion_text not in logged
 
 
+async def test_finished_requests_reach_the_validated_telemetry_file(
+    checkpoint: Checkpoint, tmp_path: Path
+) -> None:
+    """Review gap: the telemetry data contract was never on a production path.
+
+    Finished requests are now exported, one contract-validated row each, and the file holds
+    lengths, timings and a prompt digest only.
+    """
+    settings = settings_for(tmp_path)
+    app = create_api(checkpoint, settings)
+    async for client in running_client(app):
+        for index in range(3):
+            response = await client.post(
+                "/v1/completions",
+                json={"prompt": f"{SECRET_PROMPT} {index}", "max_tokens": 3},
+                headers=headers(USER),
+            )
+            assert response.status_code == 200
+        refused = await client.post(
+            "/v1/completions",
+            json={"prompt": "x", "max_tokens": 2, "deadline_ms": 1},
+            headers=headers(USER),
+        )
+        assert refused.status_code == 503
+    path = settings.data_dir / "telemetry" / "requests.jsonl"
+    text = path.read_text(encoding="utf-8")
+    exported = [json.loads(line) for line in text.splitlines()]
+    assert len(exported) == 3, "one row per finished request; refused ones never ran"
+    assert {row["key_id"] for row in exported} == {hash_api_key(USER)[:12]}
+    assert all(row["completion_tokens"] == 3 for row in exported)
+    assert all(len(str(row["prompt_sha256"])) == 64 for row in exported)
+    assert "zebra" not in text
+
+
 async def test_completion_spans_carry_lengths_and_outcomes_not_text(
     checkpoint: Checkpoint, tmp_path: Path
 ) -> None:
@@ -539,7 +573,8 @@ def test_hanging_up_on_a_non_streaming_request_aborts_it(
                     json={"prompt": "a long answer please", "max_tokens": 16},
                     headers=headers(USER),
                 )
-        assert engine.active_requests == 1, "the request should still be running at hang-up"
+        # No check of active_requests here: the server may already have noticed. An aborted
+        # count of one below is the proof -- a request that had finished cannot be aborted.
         for _ in range(300):
             if engine.active_requests == 0:
                 break

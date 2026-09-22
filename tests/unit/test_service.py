@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import threading
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -15,6 +17,7 @@ from paged_kv_serving.engine.model import LanguageModel
 from paged_kv_serving.engine.runner import ExecutionBatch, ModelRunner
 from paged_kv_serving.engine.sequence import Request, SamplingParams
 from paged_kv_serving.engine.service import EngineService
+from paged_kv_serving.engine.telemetry import TelemetryExporter
 
 pytestmark = pytest.mark.unit
 
@@ -128,3 +131,65 @@ async def test_the_readiness_allocator_check_never_runs_inside_an_iteration(
         await service.stop()
     assert healthy is True
     assert inside_when_checked == [False], inside_when_checked
+
+
+async def test_telemetry_is_written_in_batches_and_flushed_on_stop(
+    tiny_model: LanguageModel, engine_config: EngineConfig, tmp_path: Path
+) -> None:
+    engine = Engine(tiny_model, engine_config)
+    telemetry = TelemetryExporter(
+        tmp_path / "requests.jsonl", engine_clock=engine.clock, batch_size=2
+    )
+    service = EngineService(engine, idle_sleep=0.001, telemetry=telemetry)
+    await service.start()
+    identifiers = [f"{index:032x}" for index in range(3)]
+    try:
+        for identifier in identifiers:
+            request = Request(
+                request_id=identifier,
+                prompt_token_ids=(1, 2, 3),
+                sampling=SamplingParams(max_new_tokens=2),
+                key_id="tenant-a",
+                arrival_time=engine.clock(),
+            )
+            assert (await service.submit(request)).admitted
+            assert await service.collect(identifier, timeout=10.0) is not None
+        for _ in range(500):
+            if telemetry.written_rows >= 2:
+                break
+            await asyncio.sleep(0.01)
+        # A full batch goes out as soon as it is complete; the remainder waits for stop().
+        assert (telemetry.written_rows, telemetry.pending) == (2, 1)
+        assert telemetry.rejected_batches == 0
+    finally:
+        await service.stop()
+    assert telemetry.written_rows == 3
+    lines = (tmp_path / "requests.jsonl").read_text(encoding="utf-8").splitlines()
+    assert sorted(json.loads(line)["request_id"] for line in lines) == identifiers
+
+
+async def test_a_telemetry_write_failure_does_not_stop_serving(
+    tiny_model: LanguageModel, engine_config: EngineConfig, tmp_path: Path
+) -> None:
+    blocked = tmp_path / "not-a-file"
+    blocked.mkdir()  # appending to a directory fails with an OSError
+    engine = Engine(tiny_model, engine_config)
+    telemetry = TelemetryExporter(blocked, engine_clock=engine.clock, batch_size=1)
+    service = EngineService(engine, idle_sleep=0.001, telemetry=telemetry)
+    await service.start()
+    try:
+        for index in range(2):
+            identifier = f"{index:032x}"
+            request = Request(
+                request_id=identifier,
+                prompt_token_ids=(4, 5),
+                sampling=SamplingParams(max_new_tokens=2),
+                key_id="tenant-a",
+                arrival_time=engine.clock(),
+            )
+            assert (await service.submit(request)).admitted
+            assert await service.collect(identifier, timeout=10.0) is not None
+        assert service.running
+    finally:
+        await service.stop()
+    assert telemetry.written_rows == 0

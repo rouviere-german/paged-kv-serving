@@ -103,15 +103,25 @@ def validate_records(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def records_from_outputs(
-    outputs: Iterable[RequestOutput], prompt_hashes: Sequence[str]
+    outputs: Iterable[RequestOutput],
+    prompt_hashes: Sequence[str],
+    *,
+    arrival_times: Sequence[pd.Timestamp] | None = None,
 ) -> pd.DataFrame:
     """Turn engine ``RequestOutput`` objects into a contract-shaped telemetry frame.
 
     ``prompt_hashes`` is passed separately on purpose: an engine output does not carry the prompt,
-    so nothing here can reach back for the text even if a future caller wanted it to.
+    so nothing here can reach back for the text even if a future caller wanted it to. Engine
+    timestamps are monotonic seconds, not dates, so the wall-clock ``arrival_times`` come from the
+    caller (the telemetry exporter); without them every row gets a fixed placeholder date.
     """
     rows: list[dict[str, object]] = []
     for index, output in enumerate(outputs):
+        arrival = (
+            arrival_times[index]
+            if arrival_times is not None
+            else pd.Timestamp("2026-01-01", tz="UTC")
+        )
         sample = output.samples[0]
         rows.append(
             {
@@ -126,7 +136,7 @@ def records_from_outputs(
                 "preemptions": int(output.preemptions),
                 "ttft_seconds": float(output.ttft),
                 "latency_seconds": float(output.latency),
-                "arrival_time": pd.Timestamp("2026-01-01", tz="UTC"),
+                "arrival_time": arrival,
             }
         )
     frame = pd.DataFrame(rows, columns=list(_COLUMNS))

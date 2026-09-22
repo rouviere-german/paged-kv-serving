@@ -22,13 +22,16 @@ import contextlib
 from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from types import TracebackType
-from typing import TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from paged_kv_serving.core.logging import get_logger
 from paged_kv_serving.engine.admission import AdmissionDecision
 from paged_kv_serving.engine.engine import Engine, RequestOutput, TokenEvent
 from paged_kv_serving.engine.runner import BatchEntry, ExecutionBatch
 from paged_kv_serving.engine.sequence import Request
+
+if TYPE_CHECKING:  # pragma: no cover - the exporter pulls in pandas; imported by its builder
+    from paged_kv_serving.engine.telemetry import TelemetryExporter
 
 __all__ = ["EngineService", "RequestTimeoutError", "ServiceClosedError", "StreamItem"]
 
@@ -60,11 +63,20 @@ class StreamItem:
 class EngineService:
     """Owns the engine, the stepping task and one queue per in-flight request."""
 
-    def __init__(self, engine: Engine, *, idle_sleep: float = 0.002) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        idle_sleep: float = 0.002,
+        telemetry: TelemetryExporter | None = None,
+    ) -> None:
         if idle_sleep <= 0:
             raise ValueError("idle_sleep must be > 0")
         self.engine = engine
         self.idle_sleep = idle_sleep
+        self.telemetry = telemetry
+        # Prompt digests of admitted requests, kept until they finish, for the telemetry rows.
+        self._prompt_hashes: dict[str, str] = {}
         self._queues: dict[str, asyncio.Queue[StreamItem]] = {}
         self._lock = asyncio.Lock()
         self._task: asyncio.Task[None] | None = None
@@ -130,6 +142,11 @@ class EngineService:
         for queue in list(self._queues.values()):
             queue.put_nowait(StreamItem())
         self._queues.clear()
+        self._prompt_hashes.clear()
+        if self._background:
+            await asyncio.gather(*self._background, return_exceptions=True)
+        if self.telemetry is not None and self.telemetry.pending:
+            await asyncio.to_thread(self._write_telemetry, self.telemetry.take())
 
     async def __aenter__(self) -> EngineService:
         await self.start()
@@ -153,6 +170,8 @@ class EngineService:
             decision = self.engine.submit(request)
             if decision.admitted:
                 self._queues[request.request_id] = asyncio.Queue()
+                if self.telemetry is not None:
+                    self._prompt_hashes[request.request_id] = request.prompt_sha256()
         return decision
 
     async def run_exclusive(self, operation: Callable[[], _T]) -> _T:
@@ -169,6 +188,7 @@ class EngineService:
         """Cancel a request and free its blocks. Safe to call for an unknown id."""
         async with self._lock:
             removed = self.engine.abort(request_id)
+        self._prompt_hashes.pop(request_id, None)
         queue = self._queues.pop(request_id, None)
         if queue is not None:
             queue.put_nowait(StreamItem())
@@ -272,7 +292,33 @@ class EngineService:
                 queue = self._queues.pop(output.request_id, None)
                 if queue is not None:
                     queue.put_nowait(StreamItem(output=output))
+                self._record_telemetry(output)
             await asyncio.sleep(0)
+
+    # --- telemetry -----------------------------------------------------------------------
+
+    def _record_telemetry(self, output: RequestOutput) -> None:
+        digest = self._prompt_hashes.pop(output.request_id, None)
+        if self.telemetry is None or digest is None:
+            return
+        self.telemetry.record(output, digest)
+        if self.telemetry.batch_ready:
+            # Validation and the file append run off the event loop and outside the engine lock.
+            batch = self.telemetry.take()
+            task = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(self._write_telemetry, batch)
+            )
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+
+    def _write_telemetry(self, batch: list[Any]) -> None:
+        """Write one batch. A telemetry failure is logged, never allowed to stop serving."""
+        if self.telemetry is None:  # pragma: no cover - only called with an exporter
+            return
+        try:
+            self.telemetry.write(batch)
+        except (OSError, TimeoutError) as exc:
+            _log.warning("telemetry_write_failed", rows=len(batch), error_type=type(exc).__name__)
 
     # --- readiness -----------------------------------------------------------------------
 

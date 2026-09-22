@@ -61,6 +61,7 @@ from paged_kv_serving.engine.service import (
     ServiceClosedError,
     StreamItem,
 )
+from paged_kv_serving.engine.telemetry import TelemetryExporter
 from paged_kv_serving.engine.tokenizer import ByteBPETokenizer
 from paged_kv_serving.engine.weights import Checkpoint, load_checkpoint
 
@@ -214,7 +215,16 @@ def build_service(
     )
     if settings.engine_profile_on_start:
         engine.profile_latency()
-    return EngineService(engine)
+    telemetry = (
+        TelemetryExporter(
+            settings.data_dir / "telemetry" / "requests.jsonl",
+            engine_clock=engine.clock,
+            max_bytes=settings.telemetry_max_bytes,
+        )
+        if settings.telemetry_enabled
+        else None
+    )
+    return EngineService(engine, telemetry=telemetry)
 
 
 def _default_audit_log(settings: Settings) -> AuditLog:
