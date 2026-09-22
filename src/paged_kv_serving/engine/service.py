@@ -71,6 +71,8 @@ class EngineService:
         self._accepting = False
         self._stopping = False
         self._warm = False
+        # Last verdict of the readiness allocator check, reported while the lock is busy.
+        self._allocator_ok = True
         # Abort tasks started from a cancelled stream; held here so they cannot be collected.
         self._background: set[asyncio.Task[None]] = set()
 
@@ -271,13 +273,29 @@ class EngineService:
 
     # --- readiness -----------------------------------------------------------------------
 
-    def allocator_healthy(self) -> bool:
-        """True when the block allocator's invariants hold. Used by ``/readyz``."""
+    async def allocator_healthy(self, timeout: float = 1.0) -> bool:
+        """True when the block allocator's invariants hold. Used by ``/readyz``.
+
+        ``step()`` mutates the allocator in a worker thread, so reading it from the event loop
+        without the engine lock can catch it half-way through an update and report a healthy pod
+        as broken. The check therefore takes the lock like every other reader. If an iteration
+        holds the lock for longer than ``timeout``, the previous verdict is reported: a slow
+        iteration is not evidence of a broken allocator, and a probe must not queue up behind it.
+        """
+        try:
+            async with asyncio.timeout(timeout):
+                await self._lock.acquire()
+        except TimeoutError:
+            return self._allocator_ok
         try:
             self.engine.check_invariants()
+            healthy = True
         except AssertionError:
-            return False
-        return True
+            healthy = False
+        finally:
+            self._lock.release()
+        self._allocator_ok = healthy
+        return healthy
 
     def snapshot(self) -> dict[str, float]:
         return {**self.engine.snapshot(), "inflight": float(len(self._queues))}
