@@ -7,6 +7,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.corpus import DEMO_CORPUS
 from paged_kv_serving.engine.tokenizer import EOS_TOKEN, ByteBPETokenizer
 
@@ -31,7 +32,7 @@ def test_merges_shorten_text_from_the_training_corpus(trained: ByteBPETokenizer)
     assert len(trained.encode(text)) < len(text.encode("utf-8"))
 
 
-@settings(max_examples=60, deadline=None)
+@settings(max_examples=hypothesis_examples(60), deadline=None)
 @given(text=st.text(max_size=200))
 def test_every_string_round_trips(text: str, trained: ByteBPETokenizer) -> None:
     """Byte fallback means encoding is total: there is no unknown token and nothing is lost."""

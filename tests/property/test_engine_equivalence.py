@@ -26,6 +26,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.config import EngineConfig, SloClass
 from paged_kv_serving.engine.engine import Engine, RequestOutput
 from paged_kv_serving.engine.equivalence import RecordingExecutor, engine_logit_gap, sequence_tokens
@@ -121,7 +122,7 @@ def run(
 
 
 @settings(
-    max_examples=40,
+    max_examples=hypothesis_examples(40),
     deadline=None,
     suppress_health_check=[HealthCheck.too_slow, HealthCheck.data_too_large],
 )

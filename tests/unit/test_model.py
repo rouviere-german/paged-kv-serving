@@ -7,6 +7,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.config import ModelConfig
 from paged_kv_serving.engine.model import (
     LanguageModel,
@@ -140,7 +141,7 @@ def test_reference_forward_rejects_out_of_range_input() -> None:
         model.reference_forward(list(range(CONFIG.vocab_size)) * 4)
 
 
-@settings(max_examples=20, deadline=None)
+@settings(max_examples=hypothesis_examples(20), deadline=None)
 @given(
     tokens=st.lists(st.integers(min_value=0, max_value=31), min_size=1, max_size=24),
 )

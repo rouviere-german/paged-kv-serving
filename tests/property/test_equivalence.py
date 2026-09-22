@@ -23,6 +23,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.equivalence import max_logit_gap, paged_chunked_logits, split_sizes
 from paged_kv_serving.engine.model import LanguageModel
 from paged_kv_serving.engine.runner import BatchEntry, ExecutionBatch, ModelRunner
@@ -46,7 +47,7 @@ def token_sequence(draw: st.DrawFn) -> list[int]:
     return tokens(draw, vocab=64)
 
 
-@settings(max_examples=25, deadline=None)
+@settings(max_examples=hypothesis_examples(25), deadline=None)
 @given(sequence=token_sequence(), chunk=st.integers(min_value=1, max_value=13))
 def test_chunked_prefill_matches_a_cache_free_recompute(
     tiny_model: LanguageModel, sequence: list[int], chunk: int
@@ -57,7 +58,7 @@ def test_chunked_prefill_matches_a_cache_free_recompute(
     assert gap < TOLERANCE, f"chunk={chunk} len={len(sequence)} gap={gap}"
 
 
-@settings(max_examples=25, deadline=None)
+@settings(max_examples=hypothesis_examples(25), deadline=None)
 @given(sequence=token_sequence(), seed=st.integers(min_value=0, max_value=10_000))
 def test_a_scattered_block_table_gives_the_same_logits(
     tiny_model: LanguageModel, sequence: list[int], seed: int
@@ -70,7 +71,7 @@ def test_a_scattered_block_table_gives_the_same_logits(
     assert gap < TOLERANCE, f"order={order} gap={gap}"
 
 
-@settings(max_examples=20, deadline=None)
+@settings(max_examples=hypothesis_examples(20), deadline=None)
 @given(
     sequence=token_sequence(),
     split=st.integers(min_value=1, max_value=20),
@@ -102,7 +103,7 @@ def test_tile_size_does_not_change_the_result(
     assert float(np.max(np.abs(logits - reference))) < TOLERANCE
 
 
-@settings(max_examples=15, deadline=None)
+@settings(max_examples=hypothesis_examples(15), deadline=None)
 @given(
     sequences=st.lists(token_sequence(), min_size=2, max_size=4),
     decode_first=st.booleans(),
@@ -140,7 +141,7 @@ def test_batch_composition_does_not_change_a_sequences_logits(
         assert gap < TOLERANCE, f"sequence {index} gap={gap}"
 
 
-@settings(max_examples=15, deadline=None)
+@settings(max_examples=hypothesis_examples(15), deadline=None)
 @given(
     prefix=st.lists(st.integers(min_value=0, max_value=63), min_size=8, max_size=16),
     suffix_a=st.lists(st.integers(min_value=0, max_value=63), min_size=1, max_size=12),

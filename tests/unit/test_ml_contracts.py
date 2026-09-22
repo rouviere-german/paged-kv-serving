@@ -7,6 +7,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.config import SloClass
 from paged_kv_serving.engine.engine import RequestOutput, SampleOutput
 from paged_kv_serving.engine.sequence import FinishReason
@@ -30,7 +31,7 @@ def test_synthetic_records_satisfy_the_contract() -> None:
     assert len(validate_records(make_synthetic_records(200, seed=1))) == 200
 
 
-@settings(max_examples=20)
+@settings(max_examples=hypothesis_examples(20))
 @given(n=st.integers(min_value=1, max_value=40), seed=st.integers(min_value=0, max_value=10_000))
 def test_generator_always_satisfies_the_contract(n: int, seed: int) -> None:
     validate_records(make_synthetic_records(n, seed=seed))

@@ -5,6 +5,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+from hypothesis_budget import hypothesis_examples
 from paged_kv_serving.engine.sampling import greedy_token, sample_token, top_p_filter
 from paged_kv_serving.engine.sequence import SamplingParams
 
@@ -69,7 +70,7 @@ def test_logits_must_be_one_dimensional() -> None:
         )
 
 
-@settings(max_examples=40, deadline=None)
+@settings(max_examples=hypothesis_examples(40), deadline=None)
 @given(
     values=st.lists(
         st.floats(min_value=-20, max_value=20, allow_nan=False), min_size=2, max_size=64
