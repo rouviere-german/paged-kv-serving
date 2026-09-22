@@ -1,0 +1,66 @@
+{
+  "machine": {
+    "platform": "Windows-10-10.0.19045-SP0",
+    "python": "3.12.14",
+    "cpu_count": 6,
+    "processor": "Intel64 Family 6 Model 158 Stepping 10, GenuineIntel",
+    "numpy": "2.5.3",
+    "blas_threads": 1
+  },
+  "results": {
+    "block_allocate_free_16": {
+      "runs": 5000,
+      "p50_us": 5.4,
+      "p95_us": 5.4
+    },
+    "copy_on_write_block": {
+      "runs": 5000,
+      "p50_us": 1.8,
+      "p95_us": 1.9
+    },
+    "prefix_hash_chain_512_tokens": {
+      "runs": 2000,
+      "p50_us": 137.9,
+      "p95_us": 146.2
+    },
+    "paged_attention_decode_256ctx": {
+      "runs": 2000,
+      "p50_us": 131.6,
+      "p95_us": 153.1
+    },
+    "sample_top_p_512_vocab": {
+      "runs": 5000,
+      "p50_us": 75.8,
+      "p95_us": 86.4
+    },
+    "admission_decide_64_committed": {
+      "runs": 2000,
+      "p50_us": 77.9,
+      "p95_us": 89.0
+    },
+    "engine_iteration_128_tokens": {
+      "runs": 20,
+      "p50_us": 11446.2,
+      "p95_us": 12447.1
+    },
+    "engine_throughput_24_requests": {
+      "runs": 1,
+      "requests": 24.0,
+      "output_tokens": 288.0,
+      "seconds": 0.1782,
+      "tokens_per_second": 1616.19,
+      "seconds_per_request": 0.00742
+    },
+    "paged_vs_reference_equivalence": {
+      "runs": 4,
+      "max_abs_logit_gap": 2.444e-06
+    },
+    "engine_vs_reference_equivalence": {
+      "runs": 1,
+      "max_abs_logit_gap": 3.189e-06,
+      "rows_checked": 264.0,
+      "preemptions": 8.0,
+      "prefix_hit_blocks": 35.0
+    }
+  }
+}

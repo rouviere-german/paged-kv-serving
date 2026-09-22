@@ -1,0 +1,12 @@
+{
+  "block_allocate_free_16": {"p95_us": 60},
+  "copy_on_write_block": {"p95_us": 25},
+  "prefix_hash_chain_512_tokens": {"p95_us": 1500},
+  "paged_attention_decode_256ctx": {"p95_us": 1500},
+  "sample_top_p_512_vocab": {"p95_us": 800},
+  "admission_decide_64_committed": {"p95_us": 600},
+  "engine_iteration_128_tokens": {"p95_us": 150000},
+  "engine_throughput_24_requests": {"min_tokens_per_second": 200},
+  "paged_vs_reference_equivalence": {"max_abs_logit_gap": 0.0001},
+  "engine_vs_reference_equivalence": {"max_abs_logit_gap": 0.0001, "min_preemptions": 1, "min_prefix_hit_blocks": 1}
+}
