@@ -303,3 +303,137 @@ def test_without_higher_class_work_a_lower_class_is_not_capped() -> None:
     scheduler.add(batch)
     output = scheduler.schedule()
     assert output.scheduled[0].num_tokens == 16
+
+
+def distinct(
+    index: int,
+    prompt_len: int,
+    *,
+    slo_class: SloClass = SloClass.INTERACTIVE,
+    max_new_tokens: int = 4,
+    key_id: str = "tenant",
+    offset: int = 0,
+) -> Sequence:
+    """A sequence whose prompt tokens start at ``offset``, so prompts can differ or coincide."""
+    request = Request(
+        request_id=f"d{index}",
+        prompt_token_ids=tuple(offset + position for position in range(prompt_len)),
+        sampling=SamplingParams(max_new_tokens=max_new_tokens, seed=index),
+        slo_class=slo_class,
+        key_id=key_id,
+    )
+    return Sequence.from_request(request, 0)
+
+
+def step_until_idle(scheduler: Scheduler, max_iterations: int = 400) -> int:
+    """Drive the scheduler like the engine does, failing on any empty batch while work remains.
+
+    An empty batch with work queued is a livelock: nothing that could free memory runs, so the
+    next iteration is the same as this one.
+    """
+    for iteration in range(max_iterations):
+        if not scheduler.has_work:
+            return iteration
+        output = scheduler.schedule()
+        assert not output.is_empty, (
+            f"empty batch at iteration {iteration} with "
+            f"{[(s.seq_id, s.num_computed_tokens, s.num_tokens) for s in scheduler.running]} "
+            f"running and {len(scheduler.waiting)} waiting; "
+            f"{scheduler.cache.num_free_blocks} blocks free"
+        )
+        advance(scheduler, output)
+        for item in output.scheduled:
+            sequence = item.sequence
+            if sequence.num_output_tokens >= sequence.request.sampling.max_new_tokens:
+                sequence.finish(FinishReason.LENGTH, 0.0)
+        scheduler.drop_finished()
+        scheduler.cache.check_invariants()
+    pytest.fail("the scheduler did not drain")
+
+
+def test_two_prefills_that_fill_the_pool_between_them_cannot_livelock() -> None:
+    """A regression from review: two long prompts, both mid-prefill, holding every block.
+
+    Preemption used to happen only while scheduling decodes. With no decoder running, the
+    interactive prompt could not get a block, the batch prompt had none to give up, and every
+    later iteration was empty.
+    """
+    config = EngineConfig(
+        block_size=8,
+        num_blocks=16,
+        max_batched_tokens=32,
+        max_running_seqs=6,
+        max_prompt_tokens=100,
+        max_new_tokens=8,
+        max_context_tokens=128,
+        enable_prefix_cache=False,
+    )
+    scheduler = build(config)
+    batch = distinct(0, 100, slo_class=SloClass.BATCH, max_new_tokens=8, offset=1)
+    scheduler.add(batch)
+    advance(scheduler, scheduler.schedule())  # the batch prompt starts alone
+    interactive = distinct(1, 100, max_new_tokens=8, offset=200)
+    scheduler.add(interactive)
+    step_until_idle(scheduler)
+    assert scheduler.stats.preemptions >= 1
+    assert interactive.status is SequenceStatus.FINISHED
+    assert batch.status is SequenceStatus.FINISHED
+
+
+def test_a_waiting_sequence_does_not_pin_cached_blocks_while_it_waits() -> None:
+    """A waiter that looked up its prefix but could not be admitted must not keep the blocks.
+
+    Otherwise the cached blocks it matched are neither evictable nor in use, a running prefill
+    that needs them cannot progress, and the waiter itself waits for that prefill forever.
+    """
+    config = EngineConfig(
+        block_size=4,
+        num_blocks=10,
+        max_batched_tokens=16,
+        max_running_seqs=4,
+        max_prompt_tokens=32,
+        max_new_tokens=4,
+        max_context_tokens=40,
+        watermark=0.0,
+        lower_class_prefill_share=0.5,
+    )
+    scheduler = build(config)
+    warm = distinct(0, 16, max_new_tokens=1, key_id="k", offset=1)
+    scheduler.add(warm)
+    step_until_idle(scheduler)  # its four full blocks are now cached and unreferenced
+    assert len(scheduler.cache.prefix_cache) == 4
+    long_batch = distinct(1, 32, slo_class=SloClass.BATCH, max_new_tokens=2, offset=100)
+    scheduler.add(long_batch)
+    advance(scheduler, scheduler.schedule())
+    # The batch prompt holds 4 blocks, 2 are free and 4 are cached. Once the interactive waiter
+    # arrives the batch prompt is held to an 8-token allowance -- exactly the two free blocks --
+    # and the waiter matches all four cached blocks but then finds no memory for its last token.
+    waiter = distinct(2, 17, max_new_tokens=2, key_id="k", offset=1)
+    scheduler.add(waiter)
+    step_until_idle(scheduler)
+    assert waiter.status is SequenceStatus.FINISHED
+    assert long_batch.status is SequenceStatus.FINISHED
+
+
+def test_the_watermark_never_blocks_admission_into_an_idle_engine() -> None:
+    """The watermark reserves room for running decoders; with none running it protects nothing."""
+    config = EngineConfig(
+        block_size=4,
+        num_blocks=10,
+        max_batched_tokens=16,
+        max_running_seqs=4,
+        max_prompt_tokens=32,
+        max_new_tokens=4,
+        max_context_tokens=40,
+        watermark=0.5,
+    )
+    scheduler = build(config)
+    warm = distinct(0, 25, max_new_tokens=1, key_id="k", offset=1)
+    scheduler.add(warm)
+    step_until_idle(scheduler)
+    assert len(scheduler.cache.prefix_cache) == 6
+    # Same key, same first 24 tokens: six cached blocks match, four are free, the watermark is five.
+    again = distinct(1, 25, max_new_tokens=2, key_id="k", offset=1)
+    scheduler.add(again)
+    step_until_idle(scheduler)
+    assert again.status is SequenceStatus.FINISHED

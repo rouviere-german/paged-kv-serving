@@ -210,7 +210,7 @@ class Scheduler:
             remaining=self.config.lower_class_prefill_tokens,
         )
         budget = self._schedule_decodes(budget, scheduled, preempted)
-        budget = self._continue_prefills(budget, scheduled, allowance)
+        budget = self._continue_prefills(budget, scheduled, preempted, allowance)
         # Nothing new is admitted in an iteration that had to preempt. Re-admitting the victim
         # immediately would hand back the blocks that were just taken from it and preempt it
         # again next iteration; admitting somebody else instead would be a priority inversion.
@@ -269,19 +269,40 @@ class Scheduler:
         self,
         budget: int,
         scheduled: list[ScheduledSequence],
+        preempted: list[str],
         allowance: _LowerClassAllowance,
     ) -> int:
-        """Give the rest of the budget to running sequences whose prompt is still incomplete."""
+        """Give the rest of the budget to running sequences whose prompt is still incomplete.
+
+        A prefill that cannot get a single block preempts the lowest-priority prefill behind it.
+        Without that, two long prompts part-way through prefill can hold the whole pool between
+        them with no decoder left to trigger a preemption, and every later iteration is empty.
+        """
         candidates = sorted(
             (sequence for sequence in self._running if not sequence.is_decoding),
             key=lambda item: item.priority_key(),
         )
-        for sequence in candidates:
+        for position, sequence in enumerate(candidates):
             if budget <= 0:
                 break
-            chunk = min(budget, sequence.num_uncomputed_tokens)
-            chunk = min(chunk, self._max_chunk_by_memory(sequence, reserve_blocks=0))
-            chunk = allowance.clip(sequence, chunk)
+            if sequence.status is not SequenceStatus.RUNNING:
+                continue  # preempted earlier in this pass
+            wanted = allowance.clip(sequence, min(budget, sequence.num_uncomputed_tokens))
+            if wanted <= 0:
+                continue
+            chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
+            while chunk <= 0:
+                victims = [
+                    other
+                    for other in candidates[position + 1 :]
+                    if other.status is SequenceStatus.RUNNING and other.block_table
+                ]
+                if not victims:
+                    break
+                victim = victims[-1]
+                self._preempt(victim)
+                preempted.append(victim.seq_id)
+                chunk = min(wanted, self._max_chunk_by_memory(sequence, reserve_blocks=0))
             if chunk <= 0:
                 continue
             try:
@@ -309,25 +330,29 @@ class Scheduler:
     ) -> int:
         """Admit waiting sequences in priority order while budget, slots and blocks allow."""
         self._waiting.sort(key=lambda sequence: sequence.priority_key())
-        watermark = self._watermark_blocks()
         queue = deque(self._waiting)
         while queue and budget > 0 and len(self._running) < self.config.max_running_seqs:
             sequence = queue[0]
-            if not sequence.prefix_lookup_done:
-                self.cache.attach_prefix(sequence)
-                sequence.prefix_lookup_done = True
+            reuse = self.cache.attach_prefix(sequence, record=False)
+            # The watermark keeps room for the decode steps of running sequences. With nothing
+            # running it protects nobody, and honouring it could refuse the only request forever.
+            watermark = self._watermark_blocks() if self._running else 0
             chunk = min(budget, sequence.num_uncomputed_tokens)
             chunk = min(chunk, self._max_chunk_by_memory(sequence, reserve_blocks=watermark))
             chunk = allowance.clip(sequence, chunk)
             if chunk <= 0:
                 # Not enough memory (or lower-class allowance) for even one token of the
                 # highest-priority waiter. Admitting a lower-priority one instead would starve it,
-                # so the phase stops here.
+                # so the phase stops here -- and the waiter lets go of the cached blocks it matched,
+                # so that a running prefill can still evict them.
+                self.cache.detach_prefix(sequence)
                 break
             try:
                 self.cache.reserve(sequence, sequence.num_computed_tokens + chunk)
             except BlockAllocationError:  # pragma: no cover - guarded by _max_chunk_by_memory
+                self.cache.detach_prefix(sequence)
                 break
+            self.cache.record_prefix(reuse)
             queue.popleft()
             self._waiting.remove(sequence)
             sequence.status = SequenceStatus.RUNNING

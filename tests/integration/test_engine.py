@@ -9,7 +9,7 @@ import pytest
 
 from paged_kv_serving.engine.admission import RejectionReason
 from paged_kv_serving.engine.config import EngineConfig, SloClass
-from paged_kv_serving.engine.engine import Engine
+from paged_kv_serving.engine.engine import Engine, RequestOutput
 from paged_kv_serving.engine.model import LanguageModel
 from paged_kv_serving.engine.sequence import (
     FinishReason,
@@ -106,6 +106,50 @@ def test_a_preempted_request_produces_the_same_tokens(tiny_model: LanguageModel)
     assert pressured.scheduler.stats.preemptions > 0, "the tight pool should have forced a preempt"
     assert under_pressure == baseline
     pressured.check_invariants()
+
+
+@pytest.mark.parametrize("prefix_cache", [False, True])
+def test_two_long_prompts_that_fill_the_pool_drain_and_match_the_reference(
+    tiny_model: LanguageModel, prefix_cache: bool
+) -> None:
+    """Review regression: a batch prompt mid-prefill plus an interactive one used to livelock.
+
+    Between them the two prefills held every block, neither was decoding, and preemption only
+    ever ran while scheduling decodes -- so every iteration came back empty until the requests
+    timed out. Now the interactive prefill preempts the batch one and both finish, with the
+    tokens a cache-free recompute produces.
+    """
+    config = EngineConfig(
+        block_size=8,
+        num_blocks=16,
+        max_batched_tokens=32,
+        max_running_seqs=6,
+        max_prompt_tokens=100,
+        max_new_tokens=8,
+        max_context_tokens=128,
+        enable_prefix_cache=prefix_cache,
+    )
+    engine = Engine(tiny_model, config)
+    batch_prompt = [index % 64 for index in range(100)]
+    interactive_prompt = [(index * 7) % 64 for index in range(100)]
+    assert engine.submit(
+        request_for(0, batch_prompt, max_new_tokens=8, slo_class=SloClass.BATCH, key_id="t1")
+    ).admitted
+    engine.step()
+    assert engine.submit(request_for(1, interactive_prompt, max_new_tokens=8, key_id="t2")).admitted
+    outputs: list[RequestOutput] = []
+    for _ in range(500):
+        if not engine.has_work:
+            break
+        step = engine.step()
+        assert not step.is_empty, "an empty iteration while work is queued is a livelock"
+        outputs.extend(step.finished)
+    assert not engine.has_work
+    produced = {output.request_id: list(output.samples[0].token_ids) for output in outputs}
+    assert produced["req-0"] == greedy_reference(tiny_model, batch_prompt, 8)
+    assert produced["req-1"] == greedy_reference(tiny_model, interactive_prompt, 8)
+    assert engine.scheduler.stats.preemptions >= 1
+    engine.check_invariants()
 
 
 def test_parallel_sampling_shares_the_prompt_and_diverges_on_the_first_token(

@@ -238,6 +238,7 @@ class EngineService:
     # --- the loop ------------------------------------------------------------------------
 
     async def _loop(self) -> None:
+        stalled = False
         while not self._stopping:
             async with self._lock:
                 has_work = self.engine.has_work
@@ -245,6 +246,19 @@ class EngineService:
             if step is None:
                 await asyncio.sleep(self.idle_sleep)
                 continue
+            if step.is_empty:
+                # Work is queued but nothing could be scheduled. The scheduler is built so this
+                # cannot happen (docs/SCHEDULER.md, liveness), but if it ever does the loop backs
+                # off like an idle one instead of retrying at once with the lock held, which
+                # would starve every submit, abort and admin call of the lock.
+                if not stalled:
+                    _log.warning(
+                        "engine_stalled", running=step.num_running, queue_depth=step.queue_depth
+                    )
+                stalled = True
+                await asyncio.sleep(self.idle_sleep)
+                continue
+            stalled = False
             for token in step.tokens:
                 queue = self._queues.get(token.request_id)
                 if queue is not None:

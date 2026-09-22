@@ -8,9 +8,14 @@ greedy and sampled requests, parallel samples, arrivals spread over iterations).
 it with a recording executor, and every row it sampled from is compared with
 ``reference_forward`` over that sequence's final tokens.
 
-Along the way the allocator invariants are checked after every iteration, every request must
-finish with exactly the tokens it asked for, and once the prefix cache is flushed the pool must
-be whole again -- no leaks, whatever happened.
+Along the way the allocator invariants are checked after every iteration, no iteration may come
+back empty while work is queued (that would be a livelock), every request must finish with
+exactly the tokens it asked for, and once the prefix cache is flushed the pool must be whole
+again -- no leaks, whatever happened.
+
+The generator deliberately reaches the corners that hurt: prompts several times longer than the
+token budget, pools barely larger than one maximum-length sequence (so two long prefills can hold
+it between them), and up to eight parallel samples of one prompt.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from paged_kv_serving.engine.sequence import FinishReason, Request, SamplingPara
 pytestmark = pytest.mark.unit
 
 TOLERANCE = 1e-4
-MAX_PROMPT = 40
+MAX_PROMPT = 56
 MAX_NEW = 8
 MAX_CONTEXT = MAX_PROMPT + MAX_NEW
 
@@ -47,9 +52,15 @@ def scenarios(draw: st.DrawFn) -> Scenario:
     minimum = -(-MAX_CONTEXT // block_size)
     config = EngineConfig(
         block_size=block_size,
-        num_blocks=draw(st.integers(min_value=minimum, max_value=minimum * 3)),
+        # Half the draws sit within two blocks of one maximum-length sequence.
+        num_blocks=draw(
+            st.one_of(
+                st.integers(min_value=minimum, max_value=minimum + 2),
+                st.integers(min_value=minimum, max_value=minimum * 3),
+            )
+        ),
         max_batched_tokens=draw(st.integers(min_value=4, max_value=48)),
-        max_running_seqs=draw(st.integers(min_value=1, max_value=6)),
+        max_running_seqs=draw(st.integers(min_value=1, max_value=8)),
         max_prompt_tokens=MAX_PROMPT,
         max_new_tokens=MAX_NEW,
         max_context_tokens=MAX_CONTEXT,
@@ -61,7 +72,15 @@ def scenarios(draw: st.DrawFn) -> Scenario:
     shared = draw(st.lists(token, min_size=2 * block_size, max_size=2 * block_size))
     requests: list[tuple[int, Request]] = []
     for index in range(draw(st.integers(min_value=1, max_value=6))):
-        tail = draw(st.lists(token, min_size=1, max_size=16))
+        # Short questions, or prompts close to the limit: several times the token budget, and two
+        # of them are enough to fill a pool sized near one maximum-length sequence.
+        length = draw(
+            st.one_of(
+                st.integers(min_value=1, max_value=16),
+                st.integers(min_value=MAX_PROMPT - 16, max_value=MAX_PROMPT),
+            )
+        )
+        tail = draw(st.lists(token, min_size=length, max_size=length))
         prompt = ([*shared, *tail] if draw(st.booleans()) else tail)[:MAX_PROMPT]
         request = Request(
             request_id=f"r{index}",
@@ -71,7 +90,8 @@ def scenarios(draw: st.DrawFn) -> Scenario:
                 temperature=draw(st.sampled_from([0.0, 0.0, 1.0])),
                 seed=index,
             ),
-            n=draw(st.sampled_from([1, 1, 2])),
+            # Every sample needs a running slot, so n never exceeds the running-set cap.
+            n=min(draw(st.sampled_from([1, 1, 2, 8])), config.max_running_seqs),
             key_id=draw(st.sampled_from(["tenant-a", "tenant-b"])),
             slo_class=draw(st.sampled_from([SloClass.INTERACTIVE, SloClass.BATCH])),
         )
@@ -95,6 +115,7 @@ def run(
             return engine, recorder, outputs
         step = engine.step()
         engine.check_invariants()
+        assert not (step.is_empty and engine.has_work), "empty iteration with work queued"
         outputs.extend(step.finished)
     raise AssertionError("the engine did not drain")
 
@@ -141,9 +162,9 @@ def test_a_cramped_pool_really_does_preempt_and_still_matches(tiny_model: Langua
         num_blocks=12,
         max_batched_tokens=16,
         max_running_seqs=6,
-        max_prompt_tokens=MAX_PROMPT,
+        max_prompt_tokens=40,
         max_new_tokens=MAX_NEW,
-        max_context_tokens=MAX_CONTEXT,
+        max_context_tokens=48,
         watermark=0.0,
     )
     requests = tuple(

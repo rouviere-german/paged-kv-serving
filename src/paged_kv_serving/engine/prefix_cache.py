@@ -127,26 +127,33 @@ class PrefixCache:
         """The chain seed for a caller: its key id, or a constant for a global cache."""
         return key_id.encode("utf-8") if self.scope == "per_key" else b"shared"
 
-    def lookup(self, hashes: Sequence[bytes]) -> list[int]:
+    def lookup(self, hashes: Sequence[bytes], *, record: bool = True) -> list[int]:
         """Return block ids for the longest matching *prefix* of ``hashes``, increfed.
 
         Matching stops at the first miss: block 5 is only usable when blocks 0..4 were also hits,
         since a sequence's block table has to be contiguous from position zero. Every returned
         block gains a reference that the caller owns and must eventually free.
+
+        ``record=False`` leaves the hit statistics alone. The scheduler looks a waiting sequence
+        up again on every attempt to admit it, and only the attempt that succeeds should count.
         """
-        self.stats.queried_blocks += len(hashes)
-        if not self.enabled:
-            return []
         matched: list[int] = []
-        for block_hash in hashes:
-            block_id = self._entries.get(block_hash)
-            if block_id is None:
-                break
-            self._entries.move_to_end(block_hash)
-            self._manager.incref(block_id)
-            matched.append(block_id)
-        self.stats.hit_blocks += len(matched)
+        if self.enabled:
+            for block_hash in hashes:
+                block_id = self._entries.get(block_hash)
+                if block_id is None:
+                    break
+                self._entries.move_to_end(block_hash)
+                self._manager.incref(block_id)
+                matched.append(block_id)
+        if record:
+            self.record_lookup(len(hashes), len(matched))
         return matched
+
+    def record_lookup(self, queried_blocks: int, hit_blocks: int) -> None:
+        """Count one lookup in the hit statistics."""
+        self.stats.queried_blocks += queried_blocks
+        self.stats.hit_blocks += hit_blocks
 
     def register(self, block_hash: bytes, block_id: int) -> bool:
         """Cache a newly filled block. Returns False when the hash is already cached.

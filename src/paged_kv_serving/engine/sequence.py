@@ -134,9 +134,6 @@ class Sequence:
     finish_reason: FinishReason | None = None
     # Number of leading blocks taken from the prefix cache on the most recent (re)admission.
     cached_prefix_blocks: int = 0
-    # Set once the prefix cache has been consulted for this (re)admission, so a sequence that
-    # waits several iterations for memory does not query it again and again.
-    prefix_lookup_done: bool = False
     # Chained hash of every full block of this sequence, in block-table order. Its length is the
     # number of blocks that have been offered to the prefix cache.
     block_hashes: list[bytes] = field(default_factory=list)
@@ -210,7 +207,6 @@ class Sequence:
         self.block_table.clear()
         self.block_hashes.clear()
         self.cached_prefix_blocks = 0
-        self.prefix_lookup_done = False
         self.status = SequenceStatus.PREEMPTED
         self.preemption_count += 1
 

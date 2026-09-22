@@ -72,12 +72,16 @@ class KVCacheManager:
 
     # --- prefix reuse --------------------------------------------------------------------
 
-    def attach_prefix(self, sequence: Sequence) -> PrefixReuse:
+    def attach_prefix(self, sequence: Sequence, *, record: bool = True) -> PrefixReuse:
         """Adopt cached blocks for the longest matching prefix of a sequence about to prefill.
 
         At least one token is always left to compute: a request whose every block is cached still
         has to run its final token to get logits, and a zero-token iteration would produce no next
         token at all. Sharing is scoped by the caller's key id (see :mod:`prefix_cache`).
+
+        With ``record=False`` the lookup is not counted in the hit statistics; the caller either
+        records it (:meth:`record_prefix`) once the sequence is admitted or undoes it
+        (:meth:`detach_prefix`) when it is not.
         """
         if sequence.num_computed_tokens or sequence.block_table:
             raise InvariantError("attach_prefix runs before any block is allocated")
@@ -93,7 +97,7 @@ class KVCacheManager:
             chunk = sequence.token_ids[index * self.block_size : (index + 1) * self.block_size]
             parent = next_block_hash(parent, chunk, self.block_size)
             hashes.append(parent)
-        matched = self.prefix_cache.lookup(hashes)
+        matched = self.prefix_cache.lookup(hashes, record=record)
         sequence.block_table.extend(matched)
         sequence.block_hashes.extend(hashes[: len(matched)])
         sequence.cached_prefix_blocks = len(matched)
@@ -101,6 +105,22 @@ class KVCacheManager:
         return PrefixReuse(
             blocks=len(matched), tokens=len(matched) * self.block_size, queried_blocks=reusable
         )
+
+    def record_prefix(self, reuse: PrefixReuse) -> None:
+        """Count an unrecorded :meth:`attach_prefix` in the hit statistics."""
+        self.prefix_cache.record_lookup(reuse.queried_blocks, reuse.blocks)
+
+    def detach_prefix(self, sequence: Sequence) -> None:
+        """Undo :meth:`attach_prefix` for a sequence that was not admitted after all.
+
+        A waiting sequence must not keep references to the cached blocks it matched: they would be
+        neither evictable nor in use, and a running prefill that needs that memory could then wait
+        for the waiter while the waiter waits for it.
+        """
+        if sequence.num_computed_tokens != len(sequence.block_table) * self.block_size:
+            raise InvariantError("only a freshly attached prefix can be detached")
+        self.free(sequence)
+        sequence.num_computed_tokens = 0
 
     def publish_full_blocks(self, sequence: Sequence) -> int:
         """Offer every newly completed block of a sequence to the prefix cache.
